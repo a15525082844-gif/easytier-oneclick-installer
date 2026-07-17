@@ -14,7 +14,7 @@ curl --disable -fsSL https://raw.githubusercontent.com/a15525082844-gif/easytier
 
 ```bash
 curl --disable -fL https://v4.gh-proxy.org/https://raw.githubusercontent.com/a15525082844-gif/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh
-echo '895c3a029fa6ab76258801575c54303b5811a9ced93a3e37836249c6cea4c958  easytier-installer.sh' | sha256sum -c -
+echo '98b7c1254e756a88fca8198de52e420c91238f8c1fda60df5071f983df698c80  easytier-installer.sh' | sha256sum -c -
 less easytier-installer.sh
 # 确认脚本内容后再执行：
 sudo bash easytier-installer.sh --install
@@ -44,7 +44,8 @@ EASYTIER_GITHUB_PROXY=https://你的代理地址 sudo -E bash easytier-installer
 
 ## 向导怎么填写
 
-- 网络名称、网络密钥：同一虚拟网络的所有设备必须完全一致。
+- 提示中带 `[默认值]` 的项目，不输入内容直接回车就会采用该值；可选项目直接回车表示不启用。
+- 网络名称、网络密钥：同一虚拟网络的所有设备必须完全一致。网络密钥会明文显示，并预先生成一个随机默认值；直接回车采用它，再复制到其他设备即可。
 - 虚拟 IP：新手选 DHCP；服务器也可设置一个不重复的固定 IP。
 - 监听协议：默认 `tcp,udp` 已够多数场景。每种协议会单独询问端口，向导会阻止端口冲突。
 - 主动连接节点：例如 `tcp://1.2.3.4:11010`；多个地址用逗号分隔。
@@ -105,6 +106,7 @@ Windows、macOS、OpenWrt 请使用 EasyTier 官方对应安装包或插件。
 
 - 下载镜像只负责传输文件，永远不能提供自己文件的可信摘要；摘要只取自 GitHub 官方站或用户显式提供。
 - 测速会向候选镜像发送公开 EasyTier Release 的小块请求；不会向镜像发送网络密钥、GitHub Token 或私有仓库地址。
+- 配置向导会明文显示网络密钥，方便新手确认和复制；在他人可看到屏幕或终端记录的环境中，请自行输入新的强密钥。
 - 网络密钥不写入 systemd unit，但 EasyTier 以命令行参数启动；root 用户仍可从进程信息读取它。
 - 公共共享节点能够中继流量，应只选择可信节点并使用足够强的网络密钥。
 - RPC 只监听 `127.0.0.1`。公开 SOCKS5、WireGuard 或子网代理会扩大可访问范围，不需要时不要开启。

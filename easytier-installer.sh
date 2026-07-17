@@ -396,6 +396,18 @@ yesno() {
   answer=${answer:-$default}; [[ ${answer,,} == y || ${answer,,} == yes ]]
 }
 
+generate_default_secret() {
+  local random_value=''
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    IFS= read -r random_value < /proc/sys/kernel/random/uuid || random_value=''
+    random_value=${random_value//-/}
+  fi
+  if [[ ! $random_value =~ ^[0-9a-fA-F]{20,}$ ]]; then
+    random_value=$(printf '%s' "${RANDOM}-${RANDOM}-${RANDOM}-${PPID}-$(date +%s%N)" | sha256sum | awk '{print $1}')
+  fi
+  printf 'et-%s\n' "${random_value:0:20}"
+}
+
 valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && ((10#$1 <= 65535)); }
 valid_ipv4() {
   local input=$1 octet; local -a parts
@@ -446,16 +458,17 @@ validate_config_candidate() {
 }
 
 configure() {
-  local network secret mode ipv4 hostname protocols peers external proxy_nets rpc_port socks5 compression extra answer
+  local network secret default_secret mode ipv4 hostname protocols peers external proxy_nets rpc_port socks5 compression extra answer
   local vpn_port vpn_cidr proto port family key default_port
   local -a proto_items=() normalized_protocols=()
   local -A used=() seen=()
   printf '\n%s\n' '========== EasyTier 小白配置向导 =========='
-  echo '同一网络里的设备：网络名称和网络密钥必须相同，固定虚拟 IP 不能重复。直接回车会采用推荐值。'
+  echo '同一网络里的设备：网络名称和网络密钥必须相同，固定虚拟 IP 不能重复。带 [默认值] 的项目直接回车即可。'
   ask network '网络名称（英文、数字、点、下划线、短横线）' 'my-easytier'
   while [[ ! $network =~ ^[A-Za-z0-9._-]{1,64}$ ]]; do warn '网络名称格式不正确。'; ask network '请重新输入网络名称' 'my-easytier'; done
+  default_secret=$(generate_default_secret)
   while :; do
-    read -r -s -p '网络密钥（输入时不显示，至少 8 位，建议 16 位以上）: ' secret || true; echo
+    ask secret '网络密钥（明文显示；直接回车使用自动生成值，至少 8 位）' "$default_secret"
     [[ $secret != *$'\n'* && $secret != *$'\r'* ]] && ((${#secret} >= 8)) && break
     warn '密钥至少 8 位且不能包含换行。'
   done

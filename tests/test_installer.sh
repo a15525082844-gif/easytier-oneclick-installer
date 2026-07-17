@@ -54,6 +54,19 @@ assert_ok valid_proxy 'https://proxy.example/prefix'
 assert_fail valid_proxy 'http://proxy.example'
 assert_fail valid_proxy $'https://proxy.example/\nBAD=1'
 
+default_secret=$(generate_default_secret)
+[[ $default_secret =~ ^et-[0-9a-fA-F]{20}$ ]] || fail "invalid generated default secret: $default_secret"
+((pass+=1))
+ask_result=''
+ask ask_result 'test prompt' 'recommended-value' <<< ''
+assert_eq "$ask_result" 'recommended-value'
+ask ask_result 'test prompt' 'recommended-value' <<< 'visible-value'
+assert_eq "$ask_result" 'visible-value'
+if grep -F 'read -r -s' "$(dirname "$0")/../easytier-installer.sh" >/dev/null; then
+  fail 'network secret input is still hidden'
+fi
+((pass+=1))
+
 mkdir -p "$TEST_ROOT/self"
 printf '#!/usr/bin/env bash\necho ok\n' > "$TEST_ROOT/self/source.sh"
 install_self "$TEST_ROOT/self/source.sh" "$TEST_ROOT/self/dest.sh"
