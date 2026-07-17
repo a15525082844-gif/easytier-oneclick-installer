@@ -449,7 +449,7 @@ configure() {
   done
   install -d -m 0700 "$CONFIG_DIR"
   printf '%s\n' "${CONFIG_ARGS[@]}" > "${ARGS_FILE}.new"; chmod 0600 "${ARGS_FILE}.new"
-  validate_config_candidate || { rm -f -- "${ARGS_FILE}.new"; die '参数检查失败，旧配置未改动。'; }
+  validate_config_candidate "${INSTALL_DIR}/easytier-core" || { rm -f -- "${ARGS_FILE}.new"; die '参数检查失败，旧配置未改动。'; }
   ok '参数检查通过，等待启动验证。'
 }
 
@@ -503,7 +503,7 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
-  install_self
+  install_self "${BASH_SOURCE[0]}" "$SELF_PATH"
   save_proxy_env
   write_atomic "$UPDATE_SERVICE" 0644 <<EOF
 [Unit]
