@@ -8,6 +8,14 @@
 curl -fsSL https://raw.githubusercontent.com/a15525082844-gif/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh && sudo bash easytier-installer.sh
 ```
 
+中国大陆网络可使用加速地址：
+
+```bash
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/a15525082844-gif/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh && sudo bash easytier-installer.sh
+```
+
+加速地址由第三方提供；重视供应链安全时，请优先使用上面的 GitHub 官方地址，并在执行前检查脚本内容。
+
 > 建议先下载、阅读脚本，再用 `sudo` 执行。不要直接执行来源不明的 root 脚本。
 
 如果 GitHub 在中国大陆下载较慢，脚本会依次尝试官方地址和多个公开加速地址。也可以指定自己的可信代理：
