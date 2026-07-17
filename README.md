@@ -1,39 +1,46 @@
 # EasyTier 中文一键安装与自动更新脚本
 
-面向新手的 Linux / systemd 交互式安装器。它会自动识别 CPU 架构，从 EasyTier 官方 Release 安装最新稳定版，并逐步询问组网、监听端口、连接节点、子网代理等参数。
+面向新手的 Linux / systemd 交互式安装器。脚本会识别 CPU 架构，安装 [EasyTier 官方 Release](https://github.com/EasyTier/EasyTier/releases) 的最新稳定版，并逐步询问组网、监听协议、端口、连接节点、子网代理等参数。
 
-## 一键使用
+## 一键安装
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/a15525082844-gif/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh && sudo bash easytier-installer.sh
-```
-
-中国大陆网络可使用加速地址：
+GitHub 官方线路（推荐）：
 
 ```bash
-curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/a15525082844-gif/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh && sudo bash easytier-installer.sh
+curl --disable -fsSL https://raw.githubusercontent.com/a15525082844-gif/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh && sudo bash easytier-installer.sh --install
 ```
 
-加速地址由第三方提供；重视供应链安全时，请优先使用上面的 GitHub 官方地址，并在执行前检查脚本内容。
-
-> 建议先下载、阅读脚本，再用 `sudo` 执行。不要直接执行来源不明的 root 脚本。
-
-如果 GitHub 在中国大陆下载较慢，脚本会依次尝试官方地址和多个公开加速地址。也可以指定自己的可信代理：
+中国大陆网络可使用下载加速线路：
 
 ```bash
-EASYTIER_GITHUB_PROXY=https://你的代理地址 sudo -E bash easytier-installer.sh
+curl --disable -fL https://ghfast.top/https://raw.githubusercontent.com/a15525082844-gif/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh
+echo 'f7678b5383ddbc5ead8e10a3981a3d169e1b2228d86bca4b25f46a67e6fc4edc  easytier-installer.sh' | sha256sum -c -
+less easytier-installer.sh
+# 确认脚本内容后再执行：
+sudo bash easytier-installer.sh --install
 ```
 
-代理格式应为“代理前缀 + 完整 GitHub URL”，例如 `https://proxy.example.com/https://github.com/...`。
+加速地址由第三方提供，不能安全地把它直接连接到 `sudo bash`。上面的摘要与本仓库当前脚本绑定，显示 `OK` 后仍建议查看完整脚本；EasyTier 程序包无论从哪条线路下载，都必须通过 GitHub 官方 SHA-256 校验，否则拒绝安装。
 
-## 向导里最重要的四项
+若你有自己的可信 GitHub 加速地址：
 
-1. **网络名称**：同一虚拟网络的所有设备必须一致。
-2. **网络密钥**：同一虚拟网络的所有设备必须一致；请使用随机且足够长的密钥。
-3. **虚拟 IP**：新手可选 DHCP 自动分配；服务器建议设置不重复的固定 IP。
-4. **对等节点 / 公共共享节点**：至少有一个其他节点的地址，或填写一个可信共享节点，设备才能互相发现。
+```bash
+EASYTIER_GITHUB_PROXY=https://你的代理地址 sudo -E bash easytier-installer.sh --install
+```
 
-监听地址示例：`tcp://0.0.0.0:11010`。主动连接地址示例：`tcp://1.2.3.4:11010`。如果服务器有防火墙或云安全组，需要放行你选择的 TCP/UDP 端口。
+格式是“代理前缀 + 完整 GitHub URL”，例如 `https://proxy.example.com/https://github.com/...`。该地址会以 `0600` 权限保存，供每周自动更新继续使用。
+
+## 向导怎么填写
+
+- 网络名称、网络密钥：同一虚拟网络的所有设备必须完全一致。
+- 虚拟 IP：新手选 DHCP；服务器也可设置一个不重复的固定 IP。
+- 监听协议：默认 `tcp,udp` 已够多数场景。每种协议会单独询问端口，向导会阻止端口冲突。
+- 主动连接节点：例如 `tcp://1.2.3.4:11010`；多个地址用逗号分隔。
+- 公共共享节点：只填写你信任的共享节点，不清楚时可留空。
+- 子网代理、SOCKS5、WireGuard 入口：没有明确需要时都可留空或选“否”。
+- 高级参数：每行输入一个 EasyTier 原生参数或参数值，直接回车结束。
+
+TCP 与 UDP 可以使用相同数字端口；同为 TCP 或同为 UDP 的协议不能占用同一端口。使用云服务器时，还要在防火墙或安全组中放行相应的 TCP/UDP 端口。
 
 ## 安装后的命令
 
@@ -45,26 +52,47 @@ easytier-cli peer
 sudo easytier-installer --status
 sudo easytier-installer --logs
 
-# 重新运行配置向导 / 立即检查更新
+# 重新运行向导 / 立即检查更新
 sudo easytier-installer --configure
 sudo easytier-installer --update
+
+# 卸载
+sudo easytier-installer --uninstall
 ```
 
-配置保存在 `/etc/easytier/config.args`，权限为 `0600`；程序位于 `/opt/easytier`。自动更新默认每周检查一次，版本变化后才会替换二进制并重启服务。
+配置保存在 `/etc/easytier/config.args`，权限为 `0600`；程序位于 `/opt/easytier`。重新配置会真正重启服务，新配置启动失败时自动恢复旧配置。
+
+## 自动更新与回滚
+
+安装结束时可选择开启每周自动更新。更新过程会：
+
+1. 从 GitHub 官方接口取得最新版本和对应程序包的 SHA-256。
+2. 依次尝试自定义加速、GitHub 官方及多个国内加速线路。
+3. 先比对官方 SHA-256，再检查 ZIP，校验不符会丢弃并换线路。
+4. 仅在版本变化时替换程序；原服务原本停止时不会擅自启动。
+5. 更新后服务无法正常运行时，自动恢复旧程序和版本号。
+
+出于 root 供应链安全考虑，定时任务不会从可变的 `main` 分支静默替换管理脚本本身。要取得本仓库的新脚本，请重新执行上方 GitHub 官方线路的下载命令并查看变更。
+
+如果 GitHub 官方摘要来源不可达，脚本会停止安装，而不会把第三方镜像返回的文件当作可信文件。特殊网络环境可同时明确指定版本和从独立可信渠道取得的摘要：
+
+```bash
+EASYTIER_VERSION=v2.6.4 EASYTIER_SHA256=64位十六进制摘要 sudo -E bash easytier-installer.sh --install
+```
 
 ## 支持范围
 
-- 使用 systemd 的 Linux（Debian、Ubuntu、CentOS、Rocky、AlmaLinux、Fedora、Arch、Alpine 等常见发行版）
-- x86_64、aarch64、armv7、armhf、riscv64、loongarch64、mips、mipsel
-- 只安装官方 Release 中的 `easytier-core` 和 `easytier-cli`
+- 使用 systemd 的常见 Linux：Debian、Ubuntu、CentOS、Rocky、AlmaLinux、Fedora、Arch、Alpine 等。
+- x86_64、aarch64、arm/armhf、armv7/armv7hf、riscv64、loongarch64、mips、mipsel。
+- 仅安装上游 Release 中的 `easytier-core` 和 `easytier-cli`。
 
-Windows、macOS、OpenWrt 不使用本脚本；请使用 EasyTier 官方对应安装包或 OpenWrt 插件。
+Windows、macOS、OpenWrt 请使用 EasyTier 官方对应安装包或插件。
 
 ## 安全说明
 
-- 下载后优先使用 GitHub Release API 提供的 SHA-256 摘要校验；API 不可用时至少执行 ZIP 完整性检查并明确告警。
-- 网络密钥不会写入 systemd unit，但 EasyTier 以命令行参数启动，root 用户仍可从进程信息读取它。
-- 公开共享节点能够中继流量。即使 EasyTier 默认加密，也应只选择可信节点并使用强密钥。
-- 公开 RPC、SOCKS5、WireGuard 或子网代理会扩大可访问范围；不需要的功能请不要开启。
+- 下载镜像只负责传输文件，永远不能提供自己文件的可信摘要；摘要只取自 GitHub 官方站或用户显式提供。
+- 网络密钥不写入 systemd unit，但 EasyTier 以命令行参数启动；root 用户仍可从进程信息读取它。
+- 公共共享节点能够中继流量，应只选择可信节点并使用足够强的网络密钥。
+- RPC 只监听 `127.0.0.1`。公开 SOCKS5、WireGuard 或子网代理会扩大可访问范围，不需要时不要开启。
 
-上游项目：[EasyTier/EasyTier](https://github.com/EasyTier/EasyTier) · [官方中文网站](https://easytier.cn/)
+上游项目：[EasyTier/EasyTier](https://github.com/EasyTier/EasyTier) · [EasyTier 中文网站](https://easytier.cn/)
