@@ -1,0 +1,22 @@
+name: Test installer
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check documented bootstrap hash
+        run: grep -F "$(sha256sum easytier-installer.sh | awk '{print $1}')  easytier-installer.sh" README.md
+      - name: Bash syntax
+        run: bash -n easytier-installer.sh tests/test_installer.sh
+      - name: ShellCheck
+        run: shellcheck -x easytier-installer.sh tests/test_installer.sh
+      - name: Regression tests
+        run: bash tests/test_installer.sh
