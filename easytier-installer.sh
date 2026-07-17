@@ -190,34 +190,128 @@ asset_digest() {
   printf '%s\n' "$digest"
 }
 
+probe_download_candidate() {
+  local candidate=$1 result_file=$2 stats='' code='' bytes='' speed='' extra=''
+  printf '0\n' > "$result_file"
+  if stats=$(LC_ALL=C curl --disable -fsSL --proto '=https' --proto-redir '=https' \
+      --range 0-524287 --connect-timeout 4 --max-time 8 --speed-time 3 --speed-limit 8192 \
+      --limit-rate 512K -o /dev/null -w '%{http_code} %{size_download} %{speed_download}' \
+      -H 'User-Agent: easytier-oneclick-installer' "$candidate" 2>/dev/null); then
+    read -r code bytes speed extra <<< "$stats"
+    speed=${speed%%.*}
+    if [[ -z $extra && ($code == 200 || $code == 206) && $bytes =~ ^[0-9]+$ && \
+          $speed =~ ^[0-9]+$ ]] && ((10#$bytes >= 65536 && 10#$speed > 0)); then
+      printf '%s\n' "$((10#$speed))" > "$result_file"
+    fi
+  fi
+  return 0
+}
+
+try_verified_download() {
+  local candidate=$1 label=$2 part=$3 expected=$4 max_time=$5 speed_limit=$6 size=0 got=''
+  rm -f -- "$part"
+  if ! curl --disable -fL --proto '=https' --proto-redir '=https' --connect-timeout 8 \
+      --max-time "$max_time" --max-filesize "$MAX_ASSET_BYTES" --speed-time 20 \
+      --speed-limit "$speed_limit" --progress-bar -H 'User-Agent: easytier-oneclick-installer' "$candidate" \
+      | head -c "$((MAX_ASSET_BYTES + 1))" > "$part"; then
+    [[ -f $part ]] && size=$(wc -c < "$part")
+    if ((size > MAX_ASSET_BYTES)); then
+      warn "${label} 返回的文件超过 256 MiB 安全上限，已丢弃。"
+      return 20
+    fi
+    warn "${label} 速度过慢或连接失败，自动切换下一条。"
+    return 10
+  fi
+  size=$(wc -c < "$part")
+  if ((size > MAX_ASSET_BYTES)); then
+    warn "${label} 返回的文件超过 256 MiB 安全上限，已丢弃。"
+    return 20
+  fi
+  got=$(sha256sum "$part" | awk '{print tolower($1)}')
+  if [[ $got != "$expected" ]]; then
+    warn "${label} 返回的文件摘要不匹配，已丢弃。"
+    return 21
+  fi
+  if ! unzip -tqq "$part"; then
+    warn "${label} 返回的 ZIP 已损坏，已丢弃。"
+    return 22
+  fi
+  return 0
+}
+
 download_verified_asset() {
-  local version=$1 arch=$2 dest=$3 expected=$4 asset url prefix candidate got label i part size
+  local version=$1 arch=$2 dest=$3 expected=$4 asset url prefix candidate label i part
+  local count rank best_idx best_score score idx status rescue_idx
   asset="easytier-linux-${arch}-${version}.zip"
   url="https://github.com/${REPO}/releases/download/${version}/${asset}"
   part="${dest}.part"
-  local -a prefixes=() labels=()
+  local -a prefixes=() labels=() candidates=() probe_files=() pids=() scores=() order=() used=() invalid=()
   if [[ -n ${EASYTIER_GITHUB_PROXY:-} ]]; then
     valid_proxy "$EASYTIER_GITHUB_PROXY" || die "EASYTIER_GITHUB_PROXY 必须是无空格的 https:// 地址。"
     prefixes+=("${EASYTIER_GITHUB_PROXY%/}/"); labels+=("自定义加速线路")
   fi
-  prefixes+=("" "https://ghfast.top/" "https://gh-proxy.com/" "https://ghproxy.net/")
-  labels+=("GitHub 官方线路" "国内加速线路 1" "国内加速线路 2" "国内加速线路 3")
-  for ((i=0; i<${#prefixes[@]}; i++)); do
-    prefix=${prefixes[$i]}; label=${labels[$i]}; candidate="${prefix}${url}"
-    info "尝试下载：${label}"
-    rm -f -- "$part"
-    if curl --disable -fL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 1800 \
-      --max-filesize "$MAX_ASSET_BYTES" --retry 2 --speed-time 30 --speed-limit 1024 --progress-bar "$candidate" \
-      | head -c "$((MAX_ASSET_BYTES + 1))" > "$part"; then
-      size=$(wc -c < "$part")
-      if ((size > MAX_ASSET_BYTES)); then warn "${label} 返回的文件超过 256 MiB 安全上限，已丢弃。"; continue; fi
-      got=$(sha256sum "$part" | awk '{print tolower($1)}')
-      if [[ $got != "$expected" ]]; then warn "${label} 返回的文件摘要不匹配，已丢弃。"; continue; fi
-      if ! unzip -tqq "$part"; then warn "${label} 返回的 ZIP 已损坏，已丢弃。"; continue; fi
-      mv -f -- "$part" "$dest"; ok "下载完成，官方 SHA-256 校验通过。"; return 0
-    fi
-    warn "${label} 失败，自动尝试下一条。"
+  prefixes+=("https://v4.gh-proxy.org/" "https://cdn.gh-proxy.org/" "https://gh-proxy.com/" \
+    "https://ghfast.top/" "")
+  labels+=("国内优选 v4.gh-proxy.org" "加速线路 cdn.gh-proxy.org" "加速线路 gh-proxy.com" \
+    "备用线路 ghfast.top" "GitHub 官方线路")
+
+  count=${#prefixes[@]}
+  info "正在并行测速 ${count} 条下载线路，最多等待 8 秒……"
+  for ((i=0; i<count; i++)); do
+    prefix=${prefixes[i]}; candidates[i]="${prefix}${url}"
+    probe_files[i]="${part}.probe.${i}"
+    probe_download_candidate "${candidates[$i]}" "${probe_files[$i]}" &
+    pids[i]=$!
   done
+  for ((i=0; i<count; i++)); do wait "${pids[$i]}" || true; done
+  for ((i=0; i<count; i++)); do
+    score=0
+    [[ -f ${probe_files[$i]} ]] && score=$(<"${probe_files[$i]}")
+    [[ $score =~ ^[0-9]+$ ]] || score=0
+    scores[i]=$((10#$score))
+  done
+  rm -f -- "${probe_files[@]}"
+
+  for ((rank=0; rank<count; rank++)); do
+    best_idx=-1; best_score=-1
+    for ((i=0; i<count; i++)); do
+      [[ ${used[$i]:-false} == true ]] && continue
+      if ((scores[i] > best_score)); then best_idx=$i; best_score=${scores[$i]}; fi
+    done
+    order[rank]=$best_idx; used[best_idx]=true
+  done
+  if ((scores[order[0]] > 0)); then
+    ok "测速完成，优先使用：${labels[${order[0]}]}"
+  else
+    warn "测速均未返回有效结果，将按国内加速优先顺序快速尝试。"
+  fi
+
+  for idx in "${order[@]}"; do
+    candidate=${candidates[$idx]}; label=${labels[$idx]}
+    info "尝试高速下载：${label}"
+    if try_verified_download "$candidate" "$label" "$part" "$expected" 600 65536; then
+      mv -f -- "$part" "$dest"
+      ok "下载完成，官方 SHA-256 校验通过。"
+      return 0
+    else
+      status=$?
+      if ((status >= 20)); then invalid[idx]=true; fi
+    fi
+  done
+
+  rescue_idx=-1
+  for idx in "${order[@]}"; do
+    if [[ ${invalid[$idx]:-false} != true ]]; then rescue_idx=$idx; break; fi
+  done
+  if ((rescue_idx >= 0)); then
+    warn "高速线路均不可用，最后对测速最优线路进行一次低速兼容重试。"
+    candidate=${candidates[$rescue_idx]}; label=${labels[$rescue_idx]}
+    if try_verified_download "$candidate" "$label" "$part" "$expected" 1800 1024; then
+      mv -f -- "$part" "$dest"
+      ok "下载完成，官方 SHA-256 校验通过。"
+      return 0
+    fi
+  fi
   rm -f -- "$part"
   die "所有下载线路均失败。可设置可信代理：EASYTIER_GITHUB_PROXY=https://你的代理地址"
 }
