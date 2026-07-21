@@ -14,7 +14,7 @@ curl --disable -fsSL https://raw.githubusercontent.com/a15525082844-gif/easytier
 
 ```bash
 curl --disable -fL https://v4.gh-proxy.org/https://raw.githubusercontent.com/a15525082844-gif/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh
-echo '421c8fc4921bee7cee103b4a185e0f21286e56bf535ea0d9ee55ecd716c57b14  easytier-installer.sh' | sha256sum -c -
+echo 'b6708acfbd06e92381886a1d5a7208e71e27a7a3bdadd5b0c395c778fdc3d1db  easytier-installer.sh' | sha256sum -c -
 less easytier-installer.sh
 # 确认脚本内容后再执行：
 sudo bash easytier-installer.sh --install

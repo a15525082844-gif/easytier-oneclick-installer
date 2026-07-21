@@ -186,7 +186,7 @@ WEB_ADMIN_PASSWORD='Strong_Web-Password:2026!'
 WEB_BOOTSTRAP_BODY_LOG="$TEST_ROOT/web-bootstrap-body.log"
 WEB_BOOTSTRAP_ARG_LOG="$TEST_ROOT/web-bootstrap-args.log"
 : > "$WEB_BOOTSTRAP_BODY_LOG"; : > "$WEB_BOOTSTRAP_ARG_LOG"
-# shellcheck disable=SC2329 # Invoked indirectly by bootstrap_web_admin_password from the sourced installer.
+# shellcheck disable=SC2317,SC2329 # Invoked indirectly by bootstrap_web_admin_password from the sourced installer.
 curl() {
   local arg cookie='' url='' has_body=false write_status=false body=''
   printf '%s\n' "$@" >> "$WEB_BOOTSTRAP_ARG_LOG"

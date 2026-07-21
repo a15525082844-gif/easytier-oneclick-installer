@@ -836,7 +836,7 @@ stop_web_bootstrap() {
       kill -0 "$WEB_BOOTSTRAP_PID" 2>/dev/null || break
       sleep 1
     done
-    kill -0 "$WEB_BOOTSTRAP_PID" 2>/dev/null && kill -KILL "$WEB_BOOTSTRAP_PID" 2>/dev/null || true
+    if kill -0 "$WEB_BOOTSTRAP_PID" 2>/dev/null; then kill -KILL "$WEB_BOOTSTRAP_PID" 2>/dev/null || true; fi
   fi
   wait "$WEB_BOOTSTRAP_PID" 2>/dev/null || true
   WEB_BOOTSTRAP_PID=''
