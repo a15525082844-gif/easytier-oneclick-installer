@@ -89,8 +89,25 @@ printf '%s\n' '--api-server-addr' '127.0.0.1' '--api-server-port' '11211' \
   '--config-server-protocol' 'udp' '--config-server-port' '22020' > "$WEB_ARGS_FILE"
 assert_eq "$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-addr)" '127.0.0.1'
 assert_eq "$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-port)" '11211'
+assert_ok existing_web_owns_port tcp 11211
+assert_ok existing_web_owns_port udp 22020
+assert_fail existing_web_owns_port tcp 22020
 assert_fail arg_value_from_file "$WEB_ARGS_FILE" --missing
 rm -f -- "$WEB_ARGS_FILE"
+
+# shellcheck disable=SC2329 # Invoked indirectly by port_is_listening.
+ss() {
+  case " $* " in
+    *' -lnt '*) printf 'LISTEN 0 128 127.0.0.1:11211 0.0.0.0:*\n';;
+    *' -lnu '*) printf 'UNCONN 0 0 127.0.0.1:22020 0.0.0.0:*\n';;
+  esac
+}
+assert_ok port_is_listening tcp 11211
+assert_ok port_is_listening udp 22020
+assert_fail port_is_listening tcp 11212
+assert_eq "$(next_free_port tcp 11211)" '11212'
+unset -f ss
+
 printf '%s\n' '--network-name' 'name with spaces' > "${ARGS_FILE}.new"
 cat > "$TEST_ROOT/fake-core" <<'EOF'
 #!/usr/bin/env bash
@@ -122,6 +139,22 @@ grep -Fx -- '--disable-registration' "${WEB_ARGS_FILE}.new" >/dev/null || fail '
 [[ $WEB_ADMIN_PASSWORD =~ ^et-[0-9a-fA-F]{20}$ ]] || fail "invalid default web password: $WEB_ADMIN_PASSWORD"
 ((pass+=1))
 rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new"
+
+# 系统中其他程序占用 Web 默认端口时，向导应自动选择相邻空闲端口。
+# shellcheck disable=SC2329 # Invoked indirectly by configure through port_is_listening.
+ss() {
+  case " $* " in
+    *' -lnt '*) printf 'LISTEN 0 128 127.0.0.1:11211 0.0.0.0:*\n';;
+    *' -lnu '*) printf 'UNCONN 0 0 127.0.0.1:22020 0.0.0.0:*\n';;
+  esac
+}
+configure </dev/null
+assert_eq "$(arg_value_from_file "${WEB_ARGS_FILE}.new" --api-server-port)" '11212'
+assert_eq "$(arg_value_from_file "${WEB_ARGS_FILE}.new" --config-server-port)" '22021'
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --config-server)" 'udp://127.0.0.1:22021/admin'
+unset -f ss
+rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new"
+
 cat > "$INSTALL_DIR/easytier-cli" <<'EOF'
 #!/usr/bin/env bash
 if [[ ${NODE_MODE:-good} == good ]]; then

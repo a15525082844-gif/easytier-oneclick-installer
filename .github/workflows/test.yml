@@ -30,7 +30,16 @@ jobs:
       - name: Install and start the real EasyTier release
         env:
           EASYTIER_VERSION: v2.6.4
-        run: sudo --preserve-env=EASYTIER_VERSION bash ./easytier-installer.sh --install </dev/null
+        run: |
+          python3 -m http.server 11211 --bind 127.0.0.1 >/tmp/easytier-port-blocker.log 2>&1 &
+          blocker_pid=$!
+          trap 'kill "$blocker_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..20}; do
+            curl --disable --noproxy '*' -fsS "http://127.0.0.1:11211/" -o /dev/null && break
+            sleep 0.1
+          done
+          sudo --preserve-env=EASYTIER_VERSION bash ./easytier-installer.sh --install </dev/null
+          sudo grep -Fx '11212' /etc/easytier/web.args
       - name: Verify Core and Web services
         run: |
           sudo systemctl is-active --quiet easytier.service

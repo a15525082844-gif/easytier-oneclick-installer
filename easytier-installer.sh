@@ -40,6 +40,7 @@ LOCK_HELD=false
 WEB_ENABLED=false
 WEB_ADMIN_PASSWORD=''
 WEB_BOOTSTRAP_PID=''
+ERROR_MESSAGE_SHOWN=false
 
 umask 077
 
@@ -47,7 +48,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC
 info() { printf "%b[信息]%b %s\n" "$CYAN" "$NC" "$*"; }
 ok() { printf "%b[完成]%b %s\n" "$GREEN" "$NC" "$*"; }
 warn() { printf "%b[注意]%b %s\n" "$YELLOW" "$NC" "$*"; }
-die() { printf "%b[错误]%b %s\n" "$RED" "$NC" "$*" >&2; exit 1; }
+die() { ERROR_MESSAGE_SHOWN=true; printf "%b[错误]%b %s\n" "$RED" "$NC" "$*" >&2; exit 1; }
 
 need_root() {
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行：sudo bash $0"
@@ -487,6 +488,49 @@ arg_value_from_file() {
 }
 
 valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && ((10#$1 <= 65535)); }
+
+port_is_listening() {
+  local family=$1 port=$2 output='' flag
+  valid_port "$port" || return 1
+  case $family in tcp) flag=t;; udp) flag=u;; *) return 1;; esac
+  if command -v ss >/dev/null 2>&1; then
+    output=$(ss -H "-ln${flag}" 2>/dev/null || true)
+  elif command -v netstat >/dev/null 2>&1; then
+    output=$(netstat "-ln${flag}" 2>/dev/null || true)
+  else
+    return 1
+  fi
+  awk -v suffix=":${port}" '
+    {
+      for (i = 1; i <= NF; i++) {
+        if (length($i) >= length(suffix) && substr($i, length($i) - length(suffix) + 1) == suffix) found=1
+      }
+    }
+    END { exit !found }
+  ' <<< "$output"
+}
+
+existing_web_owns_port() {
+  local family=$1 port=$2 old_api='' old_proto='' old_config='' old_family=''
+  [[ -s $WEB_ARGS_FILE ]] || return 1
+  old_api=$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-port 2>/dev/null || true)
+  [[ $family == tcp && $old_api == "$port" ]] && return 0
+  old_proto=$(arg_value_from_file "$WEB_ARGS_FILE" --config-server-protocol 2>/dev/null || true)
+  old_config=$(arg_value_from_file "$WEB_ARGS_FILE" --config-server-port 2>/dev/null || true)
+  old_family=$(protocol_family "$old_proto" 2>/dev/null || true)
+  [[ $old_family == "$family" && $old_config == "$port" ]]
+}
+
+next_free_port() {
+  local family=$1 start=$2 port limit
+  valid_port "$start" || return 1
+  limit=$((10#$start + 200)); ((limit > 65535)) && limit=65535
+  for ((port=10#$start; port<=limit; port++)); do
+    if ! port_is_listening "$family" "$port"; then printf '%s\n' "$port"; return 0; fi
+  done
+  return 1
+}
+
 valid_ipv4() {
   local input=$1 octet; local -a parts
   IFS='.' read -r -a parts <<< "$input"
@@ -538,7 +582,7 @@ validate_config_candidate() {
 configure() {
   local network secret default_secret mode ipv4 hostname protocols peers external proxy_nets rpc_port socks5 compression extra answer
   local vpn_port vpn_cidr proto port family key default_port
-  local web_access web_bind web_port web_config_proto web_config_port web_family web_default_password
+  local web_access web_bind web_port web_config_proto web_config_port web_family web_default_password original_port candidate
   local -a proto_items=() normalized_protocols=()
   local -A used=() seen=()
   WEB_ENABLED=false; WEB_ADMIN_PASSWORD=''; WEB_ARGS=()
@@ -645,8 +689,19 @@ configure() {
     while :; do
       ask web_port 'Web 控制面板 TCP 端口' '11211'
       valid_port "$web_port" || { warn '端口必须在 1-65535 之间。'; continue; }
-      [[ -z ${used[tcp:$web_port]+x} ]] && break
-      warn "此 TCP 端口已被 ${used[tcp:$web_port]} 使用。"
+      if [[ -n ${used[tcp:$web_port]+x} ]]; then warn "此 TCP 端口已被 ${used[tcp:$web_port]} 使用。"; continue; fi
+      if port_is_listening tcp "$web_port" && ! existing_web_owns_port tcp "$web_port"; then
+        original_port=$web_port; candidate=$((10#$web_port + 1))
+        while :; do
+          valid_port "$candidate" || die '附近没有可自动使用的 Web TCP 端口，请先释放端口后重试。'
+          candidate=$(next_free_port tcp "$candidate") || die '附近没有可自动使用的 Web TCP 端口，请先释放端口后重试。'
+          [[ -z ${used[tcp:$candidate]+x} ]] && break
+          candidate=$((10#$candidate + 1))
+        done
+        web_port=$candidate
+        warn "检测到 TCP ${original_port} 已被其他程序占用，Web 面板已自动改用 ${web_port}。"
+      fi
+      break
     done
     used["tcp:$web_port"]='Web 控制面板'
     while :; do
@@ -659,8 +714,19 @@ configure() {
       ask web_config_port '控制面板配置下发端口（通常无需在安全组放行）' '22020'
       valid_port "$web_config_port" || { warn '端口必须在 1-65535 之间。'; continue; }
       key="${web_family}:${web_config_port}"
-      [[ -z ${used[$key]+x} ]] && break
-      warn "此 ${web_family^^} 端口已被 ${used[$key]} 使用。"
+      if [[ -n ${used[$key]+x} ]]; then warn "此 ${web_family^^} 端口已被 ${used[$key]} 使用。"; continue; fi
+      if port_is_listening "$web_family" "$web_config_port" && ! existing_web_owns_port "$web_family" "$web_config_port"; then
+        original_port=$web_config_port; candidate=$((10#$web_config_port + 1))
+        while :; do
+          valid_port "$candidate" || die '附近没有可自动使用的 Web 配置端口，请先释放端口后重试。'
+          candidate=$(next_free_port "$web_family" "$candidate") || die '附近没有可自动使用的 Web 配置端口，请先释放端口后重试。'
+          [[ -z ${used[${web_family}:$candidate]+x} ]] && break
+          candidate=$((10#$candidate + 1))
+        done
+        web_config_port=$candidate; key="${web_family}:${web_config_port}"
+        warn "检测到 ${web_family^^} ${original_port} 已被其他程序占用，配置下发端口已自动改用 ${web_config_port}。"
+      fi
+      break
     done
     used["$key"]='Web 配置下发'
     CONFIG_ARGS+=(--config-server "${web_config_proto}://127.0.0.1:${web_config_port}/admin")
@@ -792,7 +858,7 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectKernelLogs=true
 RestrictSUIDSGID=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 ReadWritePaths=${CONFIG_DIR}
 
 [Install]
@@ -880,6 +946,9 @@ bootstrap_web_admin_password() {
   done
   if [[ $ready != true ]]; then
     warn 'Web 控制面板临时启动失败，未公开面板。日志如下：'
+    if grep -Eiq 'address already in use|addrinuse|os error 98|eaddrinuse' "$log" 2>/dev/null; then
+      warn "检测到端口占用：请重新配置并换用其他 Web 端口（当前 TCP ${web_port}，配置下发 ${config_proto^^} ${config_port}）。"
+    fi
     sed -n '1,80p' "$log" >&2 || true
     stop_web_bootstrap; remove_new_web_database; rm -rf -- "$temp"
     return 1
@@ -971,12 +1040,63 @@ wait_web_healthy() {
     sleep 1
     if systemctl is-active --quiet easytier-web.service; then ((stable+=1)); else stable=0; fi
     if ((stable >= 7)); then
-      curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
-        "http://127.0.0.1:${web_port}/api/v1/auth/captcha" -o /dev/null
-      return
+      if curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
+          "http://127.0.0.1:${web_port}/api/v1/auth/captcha" -o /dev/null; then return 0; fi
+      warn "Web 服务仍在运行，但本机 HTTP 健康检查失败（127.0.0.1:${web_port}）。"
+      return 1
     fi
   done
+  warn 'Web 服务在 15 秒内未能保持稳定运行。'
   return 1
+}
+
+redact_sensitive_lines() {
+  awk '{
+    lowered=tolower($0)
+    if (lowered ~ /network[_-]secret|credential[_-]secret|local[_-]private[_-]key/) {
+      print "[诊断] 此行包含敏感配置，已隐藏。"
+    } else {
+      print
+    }
+  }'
+}
+
+show_port_owner() {
+  local family=$1 port=$2 output='' flag
+  case $family in tcp) flag=t;; udp) flag=u;; *) return 0;; esac
+  if command -v ss >/dev/null 2>&1; then
+    output=$(ss -H "-ln${flag}p" 2>/dev/null || true)
+  elif command -v netstat >/dev/null 2>&1; then
+    output=$(netstat "-ln${flag}p" 2>/dev/null || true)
+  fi
+  [[ -n $output ]] || return 0
+  printf '%s\n' "$output" | awk -v suffix=":${port}" '
+    {
+      matched=0
+      for (i = 1; i <= NF; i++) {
+        if (length($i) >= length(suffix) && substr($i, length($i) - length(suffix) + 1) == suffix) matched=1
+      }
+      if (matched) print "[端口占用] " $0
+    }
+  ' >&2
+}
+
+report_service_failure() {
+  local unit=$1 label=$2 web_port='' config_proto='' config_port=''
+  warn "${label}启动或健康检查失败，以下是自动诊断（敏感配置会隐藏）："
+  systemctl status "$unit" --no-pager -l 2>&1 | redact_sensitive_lines >&2 || true
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl -u "$unit" -n 80 --no-pager 2>&1 | redact_sensitive_lines >&2 || true
+  fi
+  if [[ $unit == easytier-web.service && -r $WEB_ARGS_FILE ]]; then
+    web_port=$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-port 2>/dev/null || true)
+    config_proto=$(arg_value_from_file "$WEB_ARGS_FILE" --config-server-protocol 2>/dev/null || true)
+    config_port=$(arg_value_from_file "$WEB_ARGS_FILE" --config-server-port 2>/dev/null || true)
+    valid_port "$web_port" && show_port_owner tcp "$web_port"
+    if valid_port "$config_port"; then
+      case $config_proto in udp) show_port_owner udp "$config_port";; tcp|ws) show_port_owner tcp "$config_port";; esac
+    fi
+  fi
 }
 
 start_web_service_checked() {
@@ -986,14 +1106,14 @@ start_web_service_checked() {
     return 0
   fi
   systemctl is-active --quiet easytier-web.service && was_active=true
-  systemctl enable easytier-web.service >/dev/null || return 1
+  if ! systemctl enable easytier-web.service >/dev/null; then report_service_failure easytier-web.service 'Web 控制面板'; return 1; fi
   if [[ $was_active == true ]]; then
-    systemctl restart easytier-web.service || return 1
+    if ! systemctl restart easytier-web.service; then report_service_failure easytier-web.service 'Web 控制面板'; return 1; fi
   else
-    systemctl start easytier-web.service || return 1
+    if ! systemctl start easytier-web.service; then report_service_failure easytier-web.service 'Web 控制面板'; return 1; fi
   fi
   if wait_web_healthy; then return 0; fi
-  systemctl status easytier-web.service --no-pager -l || true
+  report_service_failure easytier-web.service 'Web 控制面板'
   return 1
 }
 
@@ -1018,13 +1138,13 @@ verify_runtime_config() {
       --listeners) ((i+1 < ${#args[@]})) || return 1; expected+=("${args[$((i+1))]}"); ((i+=1));;
     esac
   done
-  [[ -n $rpc ]] || return 1
+  [[ -n $rpc ]] || { warn '新配置中缺少本机 RPC 地址，无法检查 Core。'; return 1; }
   for ((i=0; i<5; i++)); do
     if output=$("${INSTALL_DIR}/easytier-cli" -p "$rpc" -o json node 2>/dev/null); then rpc_ok=true; break; fi
     sleep 1
   done
-  [[ $rpc_ok == true && -n $output ]] || return 1
-  [[ $output == *'"listeners"'* ]] || return 1
+  [[ $rpc_ok == true && -n $output ]] || { warn "Core 已启动，但本机 RPC ${rpc} 在检查期限内没有响应。"; return 1; }
+  [[ $output == *'"listeners"'* ]] || { warn 'Core RPC 返回内容中缺少监听器状态。'; return 1; }
   listeners_json=${output#*'"listeners"'}
   [[ $listeners_json == *'['* && $listeners_json == *']'* ]] || return 1
   listeners_json=${listeners_json#*\[}
@@ -1049,25 +1169,26 @@ listener_present() {
 start_service_checked() {
   local was_active=false
   systemctl is-active --quiet easytier.service && was_active=true
-  systemctl enable easytier.service >/dev/null || return 1
+  if ! systemctl enable easytier.service >/dev/null; then report_service_failure easytier.service 'EasyTier Core'; return 1; fi
   if [[ $was_active == true ]]; then
-    systemctl restart easytier.service || return 1
+    if ! systemctl restart easytier.service; then report_service_failure easytier.service 'EasyTier Core'; return 1; fi
   else
-    systemctl start easytier.service || return 1
+    if ! systemctl start easytier.service; then report_service_failure easytier.service 'EasyTier Core'; return 1; fi
   fi
   if wait_service_healthy; then return 0; fi
-  systemctl status easytier.service --no-pager -l || true
+  report_service_failure easytier.service 'EasyTier Core'
   return 1
 }
 
 activate_config() {
   local core_backup="${ARGS_FILE}.backup.$$" web_backup="${WEB_ARGS_FILE}.backup.$$"
-  local had_core=false had_web=false core_active=false core_enabled=false web_active=false web_enabled=false
-  local files_ready=false
+  local had_core=false had_web=false had_web_db=false core_active=false core_enabled=false web_active=false web_enabled=false
+  local files_ready=false failure_stage='写入配置文件'
   systemctl is-active --quiet easytier.service && core_active=true
   systemctl is-enabled --quiet easytier.service && core_enabled=true
   systemctl is-active --quiet easytier-web.service && web_active=true
   systemctl is-enabled --quiet easytier-web.service && web_enabled=true
+  [[ -s $WEB_DB_FILE ]] && had_web_db=true
   if [[ -f $ARGS_FILE ]]; then cp -a -- "$ARGS_FILE" "$core_backup" || return 1; had_core=true; fi
   if [[ -f $WEB_ARGS_FILE ]]; then cp -a -- "$WEB_ARGS_FILE" "$web_backup" || { rm -f -- "$core_backup"; return 1; }; had_web=true; fi
 
@@ -1095,16 +1216,24 @@ activate_config() {
     else
       rm -f -- "$WEB_ARGS_FILE" && files_ready=true
     fi
-    if [[ $files_ready == true ]] && start_web_service_checked && start_service_checked; then
-      rm -f -- "$core_backup" "$web_backup"
-      ok 'EasyTier 与 Web 控制面板配置已生效。'
-      return 0
+    if [[ $files_ready == true ]]; then
+      failure_stage='Web 控制面板'
+      if start_web_service_checked; then
+        failure_stage='EasyTier Core'
+        if start_service_checked; then
+          rm -f -- "$core_backup" "$web_backup"
+          ok 'EasyTier 与 Web 控制面板配置已生效。'
+          return 0
+        fi
+      fi
     fi
   fi
 
+  warn "失败阶段：${failure_stage}。"
   warn '新配置启动失败，正在自动恢复旧配置。'
   rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new"
   systemctl stop easytier.service easytier-web.service >/dev/null 2>&1 || true
+  [[ $had_web_db == true ]] || remove_new_web_database
   if [[ $had_core == true ]]; then mv -f -- "$core_backup" "$ARGS_FILE" || return 1; else rm -f -- "$ARGS_FILE" || return 1; fi
   if [[ $had_web == true ]]; then mv -f -- "$web_backup" "$WEB_ARGS_FILE" || return 1; else rm -f -- "$WEB_ARGS_FILE" || return 1; fi
   systemctl reset-failed easytier.service easytier-web.service >/dev/null 2>&1 || true
@@ -1304,9 +1433,16 @@ cleanup_main() {
   return "$rc"
 }
 
+on_unhandled_error() {
+  local rc=$? line=${BASH_LINENO[0]:-${LINENO}} function_name=${FUNCNAME[1]:-main}
+  [[ $ERROR_MESSAGE_SHOWN == true ]] && return 0
+  printf "\n%b[错误]%b 未处理错误（函数 %s，第 %s 行，退出码 %s）。请保留上方诊断。\n" \
+    "$RED" "$NC" "$function_name" "$line" "$rc" >&2
+}
+
 main() {
   trap cleanup_main EXIT
-  trap 'printf "\n%b[错误]%b 第 %s 行执行失败，请保留上方输出以便排查。\n" "$RED" "$NC" "$LINENO" >&2' ERR
+  trap on_unhandled_error ERR
   validate_runtime_paths
   case ${1:-} in
     --install) do_install;; --update) do_update;; --configure) do_configure;; --uninstall) do_uninstall;;
