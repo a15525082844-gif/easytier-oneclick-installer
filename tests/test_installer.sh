@@ -95,7 +95,7 @@ assert_fail existing_web_owns_port tcp 22020
 assert_fail arg_value_from_file "$WEB_ARGS_FILE" --missing
 rm -f -- "$WEB_ARGS_FILE"
 
-# shellcheck disable=SC2329 # Invoked indirectly by port_is_listening.
+# shellcheck disable=SC2317,SC2329 # Invoked indirectly by port_is_listening.
 ss() {
   case " $* " in
     *' -lnt '*) printf 'LISTEN 0 128 127.0.0.1:11211 0.0.0.0:*\n';;
@@ -141,7 +141,7 @@ grep -Fx -- '--disable-registration' "${WEB_ARGS_FILE}.new" >/dev/null || fail '
 rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new"
 
 # 系统中其他程序占用 Web 默认端口时，向导应自动选择相邻空闲端口。
-# shellcheck disable=SC2329 # Invoked indirectly by configure through port_is_listening.
+# shellcheck disable=SC2317,SC2329 # Invoked indirectly by configure through port_is_listening.
 ss() {
   case " $* " in
     *' -lnt '*) printf 'LISTEN 0 128 127.0.0.1:11211 0.0.0.0:*\n';;
