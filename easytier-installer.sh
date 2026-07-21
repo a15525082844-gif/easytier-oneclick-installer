@@ -8,18 +8,23 @@ CONFIG_DIR=/etc/easytier
 SYSTEMD_DIR=/etc/systemd/system
 SELF_PATH=/usr/local/sbin/easytier-installer
 RUNNER_PATH=/usr/local/lib/easytier/run
+WEB_RUNNER_PATH=/usr/local/lib/easytier/run-web
 MAX_ASSET_BYTES=268435456
 if [[ ${EASYTIER_INSTALLER_TEST_MODE:-0} == 1 && ${BASH_SOURCE[0]} != "$0" ]]; then
   INSTALL_DIR=${EASYTIER_INSTALL_DIR:-$INSTALL_DIR}; BIN_DIR=${EASYTIER_BIN_DIR:-$BIN_DIR}
   CONFIG_DIR=${EASYTIER_CONFIG_DIR:-$CONFIG_DIR}; SYSTEMD_DIR=${EASYTIER_SYSTEMD_DIR:-$SYSTEMD_DIR}
   SELF_PATH=${EASYTIER_SELF_PATH:-$SELF_PATH}; RUNNER_PATH=${EASYTIER_RUNNER_PATH:-$RUNNER_PATH}
+  WEB_RUNNER_PATH=${EASYTIER_WEB_RUNNER_PATH:-$WEB_RUNNER_PATH}
   MAX_ASSET_BYTES=${EASYTIER_MAX_ASSET_BYTES:-$MAX_ASSET_BYTES}
 fi
-readonly INSTALL_DIR BIN_DIR CONFIG_DIR SYSTEMD_DIR SELF_PATH RUNNER_PATH MAX_ASSET_BYTES
+readonly INSTALL_DIR BIN_DIR CONFIG_DIR SYSTEMD_DIR SELF_PATH RUNNER_PATH WEB_RUNNER_PATH MAX_ASSET_BYTES
 readonly ARGS_FILE="${CONFIG_DIR}/config.args"
+readonly WEB_ARGS_FILE="${CONFIG_DIR}/web.args"
+readonly WEB_DB_FILE="${CONFIG_DIR}/web.db"
 readonly VERSION_FILE="${INSTALL_DIR}/VERSION"
 readonly INSTALLER_ENV_FILE="${CONFIG_DIR}/installer.env"
 readonly SERVICE_FILE="${SYSTEMD_DIR}/easytier.service"
+readonly WEB_SERVICE_FILE="${SYSTEMD_DIR}/easytier-web.service"
 readonly UPDATE_SERVICE="${SYSTEMD_DIR}/easytier-update.service"
 readonly UPDATE_TIMER="${SYSTEMD_DIR}/easytier-update.timer"
 readonly API_ROOT="https://api.github.com/repos/${REPO}/releases"
@@ -27,11 +32,16 @@ readonly RELEASES_URL="https://github.com/${REPO}/releases"
 readonly LOCK_DIR=/run/easytier-installer
 readonly LOCK_FILE=${LOCK_DIR}/lock
 
-declare -a CONFIG_ARGS=()
+declare -a CONFIG_ARGS=() WEB_ARGS=()
 BINARY_CHANGED=false
 BINARY_ROLLBACK_DIR=''
 WORK_TMP=''
 LOCK_HELD=false
+WEB_ENABLED=false
+WEB_ADMIN_PASSWORD=''
+WEB_BOOTSTRAP_PID=''
+
+umask 077
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 info() { printf "%b[信息]%b %s\n" "$CYAN" "$NC" "$*"; }
@@ -64,12 +74,13 @@ end_critical_section() { trap - HUP INT TERM; }
 validate_runtime_paths() {
   [[ $INSTALL_DIR == /opt/easytier && $BIN_DIR == /usr/local/bin && $CONFIG_DIR == /etc/easytier && \
      $SYSTEMD_DIR == /etc/systemd/system && $SELF_PATH == /usr/local/sbin/easytier-installer && \
-     $RUNNER_PATH == /usr/local/lib/easytier/run ]] || die '生产模式拒绝覆盖系统安装路径。'
+     $RUNNER_PATH == /usr/local/lib/easytier/run && $WEB_RUNNER_PATH == /usr/local/lib/easytier/run-web ]] || \
+    die '生产模式拒绝覆盖系统安装路径。'
 }
 
 install_tools() {
   local missing=() c
-  for c in curl unzip sha256sum head wc stat flock; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
+  for c in curl unzip sha256sum md5sum head wc stat flock; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
   ((${#missing[@]} == 0)) && return
   info "正在安装依赖：${missing[*]}"
   if command -v apt-get >/dev/null 2>&1; then
@@ -97,6 +108,8 @@ detect_arch() {
     *) die "暂不支持 CPU 架构：${machine}。请检查 EasyTier 官方 Release。";;
   esac
 }
+
+release_arch_supports_web() { [[ $1 != mips && $1 != mipsel ]]; }
 
 valid_version() { [[ $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; }
 valid_sha256() { [[ $1 =~ ^[0-9a-fA-F]{64}$ ]]; }
@@ -319,7 +332,7 @@ download_verified_asset() {
 begin_binary_transaction() {
   local name
   BINARY_ROLLBACK_DIR=$(mktemp -d)
-  for name in easytier-core easytier-cli VERSION; do
+  for name in easytier-core easytier-cli easytier-web-embed VERSION; do
     if [[ -e ${INSTALL_DIR}/${name} ]]; then
       cp -a -- "${INSTALL_DIR}/${name}" "${BINARY_ROLLBACK_DIR}/${name}"
       : > "${BINARY_ROLLBACK_DIR}/had-${name}"
@@ -328,11 +341,42 @@ begin_binary_transaction() {
   BINARY_CHANGED=true
 }
 
+backup_web_database_for_transaction() {
+  local suffix source backup_name
+  [[ $BINARY_CHANGED == true && -n $BINARY_ROLLBACK_DIR ]] || return 1
+  [[ ! -e ${BINARY_ROLLBACK_DIR}/web-db-backup-complete ]] || return 0
+  for suffix in '' '-wal' '-shm' '-journal'; do
+    source="${WEB_DB_FILE}${suffix}"
+    backup_name="web-db${suffix}"
+    if [[ -e $source ]]; then
+      cp -a -- "$source" "${BINARY_ROLLBACK_DIR}/${backup_name}" || return 1
+      : > "${BINARY_ROLLBACK_DIR}/had-${backup_name}"
+    fi
+  done
+  : > "${BINARY_ROLLBACK_DIR}/web-db-backup-complete"
+}
+
+restore_web_database_from_transaction() {
+  local suffix backup_name
+  [[ -e ${BINARY_ROLLBACK_DIR}/web-db-backup-complete ]] || return 0
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop easytier-web.service >/dev/null 2>&1 || return 1
+  fi
+  for suffix in '' '-wal' '-shm' '-journal'; do
+    backup_name="web-db${suffix}"
+    rm -f -- "${WEB_DB_FILE}${suffix}" || return 1
+    if [[ -e ${BINARY_ROLLBACK_DIR}/had-${backup_name} ]]; then
+      cp -a -- "${BINARY_ROLLBACK_DIR}/${backup_name}" "${WEB_DB_FILE}${suffix}" || return 1
+    fi
+  done
+}
+
 rollback_binary() {
   local name committed_rollback
   [[ $BINARY_CHANGED == true && -n $BINARY_ROLLBACK_DIR ]] || return 0
   warn "正在恢复更新前的 EasyTier 文件。"
-  for name in easytier-core easytier-cli VERSION; do
+  restore_web_database_from_transaction || return 1
+  for name in easytier-core easytier-cli easytier-web-embed VERSION; do
     rm -f -- "${INSTALL_DIR}/${name}" || return 1
     if [[ -e ${BINARY_ROLLBACK_DIR}/had-${name} ]]; then
       cp -a -- "${BINARY_ROLLBACK_DIR}/${name}" "${INSTALL_DIR}/${name}" || return 1
@@ -340,6 +384,7 @@ rollback_binary() {
   done
   if [[ -x ${INSTALL_DIR}/easytier-core ]]; then ln -sfn "${INSTALL_DIR}/easytier-core" "${BIN_DIR}/easytier-core" || return 1; else rm -f -- "${BIN_DIR}/easytier-core" || return 1; fi
   if [[ -x ${INSTALL_DIR}/easytier-cli ]]; then ln -sfn "${INSTALL_DIR}/easytier-cli" "${BIN_DIR}/easytier-cli" || return 1; else rm -f -- "${BIN_DIR}/easytier-cli" || return 1; fi
+  if [[ -x ${INSTALL_DIR}/easytier-web-embed ]]; then ln -sfn "${INSTALL_DIR}/easytier-web-embed" "${BIN_DIR}/easytier-web-embed" || return 1; else rm -f -- "${BIN_DIR}/easytier-web-embed" || return 1; fi
   committed_rollback=$BINARY_ROLLBACK_DIR
   BINARY_ROLLBACK_DIR=''; BINARY_CHANGED=false
   rm -rf -- "$committed_rollback" || warn "无法清理临时备份：${committed_rollback}"
@@ -352,12 +397,15 @@ finish_binary_transaction() {
 }
 
 install_binary() {
-  local requested=${1:-latest} arch version zip digest core cli
+  local requested=${1:-latest} arch version zip digest core cli web web_required=true
   arch=$(detect_arch)
+  release_arch_supports_web "$arch" || web_required=false
   if [[ $requested == latest ]]; then version=$(latest_version); else version=$requested; [[ $version == v* ]] || version="v${version}"; fi
   valid_version "$version" || die "版本号格式无效：${version}"
   if [[ -f $VERSION_FILE && $(<"$VERSION_FILE") == "$version" && -x ${INSTALL_DIR}/easytier-core && \
-        -x ${INSTALL_DIR}/easytier-cli && -x ${BIN_DIR}/easytier-core && -x ${BIN_DIR}/easytier-cli ]]; then
+        -x ${INSTALL_DIR}/easytier-cli && -x ${BIN_DIR}/easytier-core && -x ${BIN_DIR}/easytier-cli ]] && \
+     { [[ $web_required == false ]] || \
+       [[ -x ${INSTALL_DIR}/easytier-web-embed && -x ${BIN_DIR}/easytier-web-embed ]]; }; then
     ok "已是最新版本 ${version}，无需重复下载。"; return 0
   fi
   WORK_TMP=$(mktemp -d); zip="${WORK_TMP}/easytier.zip"
@@ -366,21 +414,29 @@ install_binary() {
   unzip -q "$zip" -d "${WORK_TMP}/out"
   core=$(find "${WORK_TMP}/out" -type f -name easytier-core -print -quit)
   cli=$(find "${WORK_TMP}/out" -type f -name easytier-cli -print -quit)
-  [[ -n $core && -n $cli ]] || die "压缩包内缺少 easytier-core/easytier-cli。"
+  web=$(find "${WORK_TMP}/out" -type f -name easytier-web-embed -print -quit)
+  [[ -n $core && -n $cli ]] || die "压缩包内缺少 easytier-core 或 easytier-cli。"
+  [[ $web_required == false || -n $web ]] || die "压缩包内缺少 easytier-web-embed。"
   chmod 0755 "$core" "$cli"
+  [[ -z $web ]] || chmod 0755 "$web"
   "$core" --version >/dev/null 2>&1 || die '下载的 easytier-core 无法在当前系统运行。'
   "$cli" --version >/dev/null 2>&1 || die '下载的 easytier-cli 无法在当前系统运行。'
+  [[ -z $web ]] || "$web" --version >/dev/null 2>&1 || die '下载的 easytier-web-embed 无法在当前系统运行。'
   install -d -m 0755 "$INSTALL_DIR" "$BIN_DIR"
   begin_binary_transaction
   install -m 0755 "$core" "${INSTALL_DIR}/easytier-core.new"
   install -m 0755 "$cli" "${INSTALL_DIR}/easytier-cli.new"
+  [[ -z $web ]] || install -m 0755 "$web" "${INSTALL_DIR}/easytier-web-embed.new"
   mv -f -- "${INSTALL_DIR}/easytier-core.new" "${INSTALL_DIR}/easytier-core"
   mv -f -- "${INSTALL_DIR}/easytier-cli.new" "${INSTALL_DIR}/easytier-cli"
+  [[ -z $web ]] || mv -f -- "${INSTALL_DIR}/easytier-web-embed.new" "${INSTALL_DIR}/easytier-web-embed"
   ln -sfn "${INSTALL_DIR}/easytier-core" "${BIN_DIR}/easytier-core"
   ln -sfn "${INSTALL_DIR}/easytier-cli" "${BIN_DIR}/easytier-cli"
+  [[ -z $web ]] || ln -sfn "${INSTALL_DIR}/easytier-web-embed" "${BIN_DIR}/easytier-web-embed"
   printf '%s\n' "$version" > "${VERSION_FILE}.new"; chmod 0644 "${VERSION_FILE}.new"; mv -f -- "${VERSION_FILE}.new" "$VERSION_FILE"
   rm -rf -- "$WORK_TMP"; WORK_TMP=''
   ok "EasyTier ${version} 已准备完成（${arch}）。"
+  [[ -n $web ]] || warn '上游当前未给此架构提供 easytier-web-embed，Core/CLI 仍可正常使用。'
 }
 
 ask() {
@@ -406,6 +462,28 @@ generate_default_secret() {
     random_value=$(printf '%s' "${RANDOM}-${RANDOM}-${RANDOM}-${PPID}-$(date +%s%N)" | sha256sum | awk '{print $1}')
   fi
   printf 'et-%s\n' "${random_value:0:20}"
+}
+
+valid_web_password() {
+  ((${#1} >= 12 && ${#1} <= 128)) && [[ $1 =~ ^[-A-Za-z0-9._~!@%+=:/]+$ ]]
+}
+
+md5_hex() {
+  printf '%s' "$1" | md5sum | awk '{print tolower($1)}'
+}
+
+arg_value_from_file() {
+  local file=$1 wanted=$2 i; local -a args
+  [[ -r $file ]] || return 1
+  mapfile -t args < "$file" || return 1
+  for ((i=0; i<${#args[@]}; i++)); do
+    if [[ ${args[$i]} == "$wanted" ]]; then
+      ((i+1 < ${#args[@]})) || return 1
+      printf '%s\n' "${args[$((i+1))]}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && ((10#$1 <= 65535)); }
@@ -460,8 +538,11 @@ validate_config_candidate() {
 configure() {
   local network secret default_secret mode ipv4 hostname protocols peers external proxy_nets rpc_port socks5 compression extra answer
   local vpn_port vpn_cidr proto port family key default_port
+  local web_access web_bind web_port web_config_proto web_config_port web_family web_default_password
   local -a proto_items=() normalized_protocols=()
   local -A used=() seen=()
+  WEB_ENABLED=false; WEB_ADMIN_PASSWORD=''; WEB_ARGS=()
+  rm -f -- "${WEB_ARGS_FILE}.new"
   printf '\n%s\n' '========== EasyTier 小白配置向导 =========='
   echo '同一网络里的设备：网络名称和网络密钥必须相同，固定虚拟 IP 不能重复。带 [默认值] 的项目直接回车即可。'
   ask network '网络名称（英文、数字、点、下划线、短横线）' 'my-easytier'
@@ -509,12 +590,14 @@ configure() {
     valid_port "$rpc_port" || { warn '端口必须在 1-65535 之间。'; continue; }
     [[ -z ${used[tcp:$rpc_port]+x} ]] && break; warn 'RPC 端口与 TCP 类监听端口冲突。'
   done
+  used["tcp:$rpc_port"]='本机 RPC'
   while :; do
     ask socks5 'SOCKS5 端口（留空表示不开启）' ''
     [[ -z $socks5 ]] && break
     valid_port "$socks5" || { warn '端口必须在 1-65535 之间。'; continue; }
     [[ $socks5 != "$rpc_port" && -z ${used[tcp:$socks5]+x} ]] && break; warn 'SOCKS5 端口与其他 TCP 端口冲突。'
   done
+  [[ -z $socks5 ]] || used["tcp:$socks5"]='SOCKS5'
   ask compression '压缩方式（none/zstd）' 'none'
   [[ $compression == none || $compression == zstd ]] || die '压缩方式只能是 none 或 zstd。'
   append_csv_args --peers "$peers"
@@ -534,10 +617,73 @@ configure() {
       valid_ipv4_cidr "$vpn_cidr" && break; warn '请输入有效的 IPv4 CIDR（例如 10.14.14.0/24）。'
     done
     CONFIG_ARGS+=(--vpn-portal "wg://0.0.0.0:${vpn_port}/${vpn_cidr}")
+    used["udp:$vpn_port"]='WireGuard 入口'
   fi
   yesno '启用多线程？（服务器或多连接设备建议开启）' y && CONFIG_ARGS+=(--multi-thread)
   yesno '启用延迟优先选路？' y && CONFIG_ARGS+=(--latency-first)
   yesno '禁用 IPv6？' n && CONFIG_ARGS+=(--disable-ipv6)
+
+  if [[ ! -x ${INSTALL_DIR}/easytier-web-embed ]]; then
+    warn '当前安装包没有 Web 控制面板组件，将继续使用 Core/CLI。'
+  elif yesno '启用 Web 控制面板？' y; then
+    WEB_ENABLED=true
+    printf '%s\n' \
+      'Web 访问范围：' \
+      '  1) 仅本机（推荐；通过 SSH 隧道访问，不向公网暴露）' \
+      '  2) 局域网 / 公网直接访问（需要防火墙或安全组放行）'
+    while :; do
+      ask web_access '请选择访问范围（1/2）' '1'
+      [[ $web_access == 1 || $web_access == 2 ]] && break
+      warn '请输入 1 或 2。'
+    done
+    if [[ $web_access == 1 ]]; then
+      web_bind=127.0.0.1
+    else
+      web_bind=0.0.0.0
+      warn '控制面板使用 HTTP。公网使用时请限制来源 IP，并建议在前面配置 HTTPS 反向代理。'
+    fi
+    while :; do
+      ask web_port 'Web 控制面板 TCP 端口' '11211'
+      valid_port "$web_port" || { warn '端口必须在 1-65535 之间。'; continue; }
+      [[ -z ${used[tcp:$web_port]+x} ]] && break
+      warn "此 TCP 端口已被 ${used[tcp:$web_port]} 使用。"
+    done
+    used["tcp:$web_port"]='Web 控制面板'
+    while :; do
+      ask web_config_proto 'Core 连接控制面板的协议（udp/tcp/ws）' 'udp'
+      [[ $web_config_proto =~ ^(udp|tcp|ws)$ ]] && break
+      warn '协议只能是 udp、tcp 或 ws。'
+    done
+    web_family=$(protocol_family "$web_config_proto")
+    while :; do
+      ask web_config_port '控制面板配置下发端口（通常无需在安全组放行）' '22020'
+      valid_port "$web_config_port" || { warn '端口必须在 1-65535 之间。'; continue; }
+      key="${web_family}:${web_config_port}"
+      [[ -z ${used[$key]+x} ]] && break
+      warn "此 ${web_family^^} 端口已被 ${used[$key]} 使用。"
+    done
+    used["$key"]='Web 配置下发'
+    CONFIG_ARGS+=(--config-server "${web_config_proto}://127.0.0.1:${web_config_port}/admin")
+    WEB_ARGS=(
+      --db "$WEB_DB_FILE"
+      --api-server-addr "$web_bind"
+      --api-server-port "$web_port"
+      --config-server-protocol "$web_config_proto"
+      --config-server-port "$web_config_port"
+      --disable-registration
+      --console-log-level info
+    )
+    if [[ ! -s $WEB_DB_FILE ]]; then
+      web_default_password=$(generate_default_secret)
+      while :; do
+        ask WEB_ADMIN_PASSWORD 'Web 管理员 admin 的新密码（明文显示；直接回车使用随机值）' "$web_default_password"
+        valid_web_password "$WEB_ADMIN_PASSWORD" && break
+        warn '密码需为 12-128 位，只能使用英文字母、数字及 -._~!@%+=:/。'
+      done
+    else
+      info '检测到已有 Web 账户数据库，将保留当前登录密码。'
+    fi
+  fi
 
   echo '高级用户可逐行加入 EasyTier 原生参数；每行一个参数或值，直接回车结束。'
   while :; do
@@ -549,6 +695,7 @@ configure() {
       --dhcp|--dhcp=*|-d|-d?*|--ipv4|--ipv4=*|-i|-i?*|-p|-p?*|--peers|--peers=*|-e|-e?*|--external-node|--external-node=*|\
       -n|-n?*|--proxy-networks|--proxy-networks=*|--listeners|--listeners=*|-l|-l?*|--no-listener|\
       --rpc-portal|--rpc-portal=*|-r|-r?*|--socks5|--socks5=*|--vpn-portal|--vpn-portal=*|\
+      --config-server|--config-server=*|-w|-w?*|\
       --compression|--compression=*|--multi-thread|--multi-thread=*|--latency-first|--latency-first=*|--disable-ipv6|--disable-ipv6=*)
         warn '此参数已由向导管理，不能在高级参数中重复添加。'; continue;;
     esac
@@ -556,6 +703,9 @@ configure() {
   done
   install -d -m 0700 "$CONFIG_DIR"
   printf '%s\n' "${CONFIG_ARGS[@]}" > "${ARGS_FILE}.new"; chmod 0600 "${ARGS_FILE}.new"
+  if [[ $WEB_ENABLED == true ]]; then
+    printf '%s\n' "${WEB_ARGS[@]}" > "${WEB_ARGS_FILE}.new"; chmod 0600 "${WEB_ARGS_FILE}.new"
+  fi
   validate_config_candidate "${INSTALL_DIR}/easytier-core" || { rm -f -- "${ARGS_FILE}.new"; die '参数检查失败，旧配置未改动。'; }
   ok '参数检查通过，等待启动验证。'
 }
@@ -591,10 +741,16 @@ set -Eeuo pipefail
 mapfile -t args < ${ARGS_FILE}
 exec ${INSTALL_DIR}/easytier-core "\${args[@]}"
 EOF
+  write_atomic "$WEB_RUNNER_PATH" 0755 <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+mapfile -t args < ${WEB_ARGS_FILE}
+exec ${INSTALL_DIR}/easytier-web-embed "\${args[@]}"
+EOF
   write_atomic "$SERVICE_FILE" 0644 <<EOF
 [Unit]
 Description=EasyTier mesh VPN
-After=network-online.target
+After=network-online.target easytier-web.service
 Wants=network-online.target
 
 [Service]
@@ -606,6 +762,38 @@ LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  write_atomic "$WEB_SERVICE_FILE" 0644 <<EOF
+[Unit]
+Description=EasyTier Web control panel
+After=network-online.target
+Wants=network-online.target
+Before=easytier.service
+ConditionPathExists=${WEB_ARGS_FILE}
+
+[Service]
+Type=simple
+ExecStart=${WEB_RUNNER_PATH}
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=${CONFIG_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -637,6 +825,176 @@ Persistent=true
 WantedBy=timers.target
 EOF
   systemctl daemon-reload
+}
+
+stop_web_bootstrap() {
+  local i
+  [[ -n $WEB_BOOTSTRAP_PID ]] || return 0
+  if kill -0 "$WEB_BOOTSTRAP_PID" 2>/dev/null; then
+    kill "$WEB_BOOTSTRAP_PID" 2>/dev/null || true
+    for ((i=0; i<5; i++)); do
+      kill -0 "$WEB_BOOTSTRAP_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -0 "$WEB_BOOTSTRAP_PID" 2>/dev/null && kill -KILL "$WEB_BOOTSTRAP_PID" 2>/dev/null || true
+  fi
+  wait "$WEB_BOOTSTRAP_PID" 2>/dev/null || true
+  WEB_BOOTSTRAP_PID=''
+}
+
+remove_new_web_database() {
+  rm -f -- "$WEB_DB_FILE" "${WEB_DB_FILE}-wal" "${WEB_DB_FILE}-shm" "${WEB_DB_FILE}-journal"
+}
+
+bootstrap_web_admin_password() {
+  local args_file="${WEB_ARGS_FILE}.new" web_port config_proto config_port temp log cookie old_hash new_hash
+  local user_old_hash user_new_hash user_random user_status ready=false i
+  [[ $WEB_ENABLED == true && -n $WEB_ADMIN_PASSWORD ]] || return 0
+  if [[ -e $WEB_DB_FILE && ! -s $WEB_DB_FILE ]]; then remove_new_web_database; fi
+  [[ ! -e $WEB_DB_FILE ]] || return 0
+  web_port=$(arg_value_from_file "$args_file" --api-server-port) || return 1
+  config_proto=$(arg_value_from_file "$args_file" --config-server-protocol) || return 1
+  config_port=$(arg_value_from_file "$args_file" --config-server-port) || return 1
+  valid_port "$web_port" && valid_port "$config_port" || return 1
+  [[ $config_proto =~ ^(udp|tcp|ws)$ ]] || return 1
+
+  temp=$(mktemp -d); log="${temp}/web.log"; cookie="${temp}/cookie"
+  info '正在本机安全初始化 Web 管理员密码……'
+  "${INSTALL_DIR}/easytier-web-embed" \
+    --db "$WEB_DB_FILE" \
+    --api-server-addr 127.0.0.1 \
+    --api-server-port "$web_port" \
+    --config-server-protocol "$config_proto" \
+    --config-server-port "$config_port" \
+    --disable-registration \
+    --console-log-level info >"$log" 2>&1 &
+  WEB_BOOTSTRAP_PID=$!
+
+  for ((i=0; i<30; i++)); do
+    if curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 4 \
+        "http://127.0.0.1:${web_port}/api/v1/auth/captcha" -o /dev/null 2>/dev/null; then
+      ready=true; break
+    fi
+    kill -0 "$WEB_BOOTSTRAP_PID" 2>/dev/null || break
+    sleep 1
+  done
+  if [[ $ready != true ]]; then
+    warn 'Web 控制面板临时启动失败，未公开面板。日志如下：'
+    sed -n '1,80p' "$log" >&2 || true
+    stop_web_bootstrap; remove_new_web_database; rm -rf -- "$temp"
+    return 1
+  fi
+
+  old_hash=21232f297a57a5a743894a0e4a801fc3
+  new_hash=$(md5_hex "$WEB_ADMIN_PASSWORD")
+  if ! printf '{"username":"admin","password":"%s"}' "$old_hash" | \
+    curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 8 \
+      -c "$cookie" -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "http://127.0.0.1:${web_port}/api/v1/auth/login" -o /dev/null; then
+    warn '无法使用上游初始账户完成 Web 安全初始化，未公开面板。'
+    stop_web_bootstrap; remove_new_web_database; rm -rf -- "$temp"
+    return 1
+  fi
+  if ! printf '{"new_password":"%s"}' "$new_hash" | \
+    curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 8 \
+      -b "$cookie" -X PUT -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "http://127.0.0.1:${web_port}/api/v1/auth/password" -o /dev/null; then
+    warn 'Web 管理员密码修改失败，未公开面板。'
+    stop_web_bootstrap; remove_new_web_database; rm -rf -- "$temp"
+    return 1
+  fi
+  rm -f -- "$cookie"
+  if ! printf '{"username":"admin","password":"%s"}' "$new_hash" | \
+    curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 8 \
+      -c "$cookie" -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "http://127.0.0.1:${web_port}/api/v1/auth/login" -o /dev/null; then
+    warn 'Web 新管理员密码验证失败，未公开面板。'
+    stop_web_bootstrap; remove_new_web_database; rm -rf -- "$temp"
+    return 1
+  fi
+
+  user_old_hash=ee11cbb19052e40b07aac0ca060c23ee
+  user_random="$(generate_default_secret)-$(generate_default_secret)"
+  user_new_hash=$(md5_hex "$user_random")
+  rm -f -- "$cookie"
+  if ! user_status=$(printf '{"username":"user","password":"%s"}' "$user_old_hash" | \
+    curl --disable --noproxy '*' -sS --connect-timeout 2 --max-time 8 \
+      -c "$cookie" -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "http://127.0.0.1:${web_port}/api/v1/auth/login" -o /dev/null -w '%{http_code}'); then
+    warn '无法检查 Web 内置 user 账户，未公开面板。'
+    stop_web_bootstrap; remove_new_web_database; rm -rf -- "$temp"
+    return 1
+  fi
+  if [[ $user_status == 200 ]]; then
+    if ! printf '{"new_password":"%s"}' "$user_new_hash" | \
+      curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 8 \
+      -b "$cookie" -X PUT -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "http://127.0.0.1:${web_port}/api/v1/auth/password" -o /dev/null; then
+      warn 'Web 内置 user 账户的默认密码替换失败，未公开面板。'
+      stop_web_bootstrap; remove_new_web_database; rm -rf -- "$temp"
+      return 1
+    fi
+    rm -f -- "$cookie"
+    if ! printf '{"username":"user","password":"%s"}' "$user_new_hash" | \
+      curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 8 \
+        -c "$cookie" -H 'Content-Type: application/json' \
+        --data-binary @- \
+        "http://127.0.0.1:${web_port}/api/v1/auth/login" -o /dev/null; then
+      warn 'Web 内置 user 账户的新随机密码验证失败，未公开面板。'
+      stop_web_bootstrap; remove_new_web_database; rm -rf -- "$temp"
+      return 1
+    fi
+  elif [[ $user_status == 401 ]]; then
+    info '上游内置 user/user 登录已不可用，无需替换。'
+  else
+    warn "检查 Web 内置 user 账户时收到异常 HTTP 状态：${user_status}。"
+    stop_web_bootstrap; remove_new_web_database; rm -rf -- "$temp"
+    return 1
+  fi
+  stop_web_bootstrap
+  for i in "$WEB_DB_FILE" "${WEB_DB_FILE}-wal" "${WEB_DB_FILE}-shm"; do [[ ! -e $i ]] || chmod 0600 "$i"; done
+  rm -rf -- "$temp"
+  ok 'Web 内置默认密码均已替换，自助注册已关闭。'
+}
+
+wait_web_healthy() {
+  local web_port i stable=0
+  [[ -r $WEB_ARGS_FILE ]] || return 1
+  web_port=$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-port) || return 1
+  valid_port "$web_port" || return 1
+  for ((i=0; i<15; i++)); do
+    sleep 1
+    if systemctl is-active --quiet easytier-web.service; then ((stable+=1)); else stable=0; fi
+    if ((stable >= 7)); then
+      curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
+        "http://127.0.0.1:${web_port}/api/v1/auth/captcha" -o /dev/null
+      return
+    fi
+  done
+  return 1
+}
+
+start_web_service_checked() {
+  local was_active=false
+  if [[ ! -s $WEB_ARGS_FILE ]]; then
+    systemctl disable --now easytier-web.service >/dev/null 2>&1 || true
+    return 0
+  fi
+  systemctl is-active --quiet easytier-web.service && was_active=true
+  systemctl enable easytier-web.service >/dev/null || return 1
+  if [[ $was_active == true ]]; then
+    systemctl restart easytier-web.service || return 1
+  else
+    systemctl start easytier-web.service || return 1
+  fi
+  if wait_web_healthy; then return 0; fi
+  systemctl status easytier-web.service --no-pager -l || true
+  return 1
 }
 
 wait_service_healthy() {
@@ -703,21 +1061,64 @@ start_service_checked() {
 }
 
 activate_config() {
-  local backup="${ARGS_FILE}.backup.$$" had_old=false was_active=false was_enabled=false
-  systemctl is-active --quiet easytier.service && was_active=true
-  systemctl is-enabled --quiet easytier.service && was_enabled=true
-  if [[ -f $ARGS_FILE ]]; then cp -a -- "$ARGS_FILE" "$backup" || return 1; had_old=true; fi
-  if mv -f -- "${ARGS_FILE}.new" "$ARGS_FILE" && chmod 0600 "$ARGS_FILE" && start_service_checked; then
-    rm -f -- "$backup"; ok 'EasyTier 服务正在运行，新配置已生效。'; return 0
+  local core_backup="${ARGS_FILE}.backup.$$" web_backup="${WEB_ARGS_FILE}.backup.$$"
+  local had_core=false had_web=false core_active=false core_enabled=false web_active=false web_enabled=false
+  local files_ready=false
+  systemctl is-active --quiet easytier.service && core_active=true
+  systemctl is-enabled --quiet easytier.service && core_enabled=true
+  systemctl is-active --quiet easytier-web.service && web_active=true
+  systemctl is-enabled --quiet easytier-web.service && web_enabled=true
+  if [[ -f $ARGS_FILE ]]; then cp -a -- "$ARGS_FILE" "$core_backup" || return 1; had_core=true; fi
+  if [[ -f $WEB_ARGS_FILE ]]; then cp -a -- "$WEB_ARGS_FILE" "$web_backup" || { rm -f -- "$core_backup"; return 1; }; had_web=true; fi
+
+  if [[ $BINARY_CHANGED == true && $web_active == true ]]; then
+    if ! systemctl stop easytier-web.service || ! backup_web_database_for_transaction; then
+      warn '无法安全备份 Web 账户数据库，已中止本次替换。'
+      rm -f -- "$core_backup" "$web_backup"
+      return 1
+    fi
   fi
+
+  if [[ $WEB_ENABLED == true && -n $WEB_ADMIN_PASSWORD ]]; then
+    systemctl stop easytier-web.service >/dev/null 2>&1 || true
+    if ! bootstrap_web_admin_password; then
+      if [[ $web_active == true ]]; then systemctl start easytier-web.service >/dev/null 2>&1 || true; fi
+      [[ $web_enabled == true ]] || systemctl disable easytier-web.service >/dev/null 2>&1 || true
+      rm -f -- "$core_backup" "$web_backup"
+      return 1
+    fi
+  fi
+
+  if mv -f -- "${ARGS_FILE}.new" "$ARGS_FILE" && chmod 0600 "$ARGS_FILE"; then
+    if [[ -f ${WEB_ARGS_FILE}.new ]]; then
+      if mv -f -- "${WEB_ARGS_FILE}.new" "$WEB_ARGS_FILE" && chmod 0600 "$WEB_ARGS_FILE"; then files_ready=true; fi
+    else
+      rm -f -- "$WEB_ARGS_FILE" && files_ready=true
+    fi
+    if [[ $files_ready == true ]] && start_web_service_checked && start_service_checked; then
+      rm -f -- "$core_backup" "$web_backup"
+      ok 'EasyTier 与 Web 控制面板配置已生效。'
+      return 0
+    fi
+  fi
+
   warn '新配置启动失败，正在自动恢复旧配置。'
-  if [[ $had_old == true ]]; then mv -f -- "$backup" "$ARGS_FILE" || return 1; else rm -f -- "$ARGS_FILE" || return 1; fi
-  systemctl reset-failed easytier.service >/dev/null 2>&1 || true
-  if [[ $had_old == true && $was_active == true ]]; then
-    systemctl restart easytier.service >/dev/null 2>&1 || true
-    wait_service_healthy || warn '旧配置也未能恢复运行，请查看 systemctl status easytier。'
-  else systemctl stop easytier.service >/dev/null 2>&1 || true; fi
-  [[ $was_enabled == true ]] || systemctl disable easytier.service >/dev/null 2>&1 || true
+  rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new"
+  systemctl stop easytier.service easytier-web.service >/dev/null 2>&1 || true
+  if [[ $had_core == true ]]; then mv -f -- "$core_backup" "$ARGS_FILE" || return 1; else rm -f -- "$ARGS_FILE" || return 1; fi
+  if [[ $had_web == true ]]; then mv -f -- "$web_backup" "$WEB_ARGS_FILE" || return 1; else rm -f -- "$WEB_ARGS_FILE" || return 1; fi
+  systemctl reset-failed easytier.service easytier-web.service >/dev/null 2>&1 || true
+
+  if [[ $had_web == true && $web_active == true ]]; then
+    systemctl start easytier-web.service >/dev/null 2>&1 || true
+    wait_web_healthy || warn '旧 Web 控制面板未能恢复运行。'
+  fi
+  if [[ $web_enabled == true ]]; then systemctl enable easytier-web.service >/dev/null 2>&1 || true; else systemctl disable easytier-web.service >/dev/null 2>&1 || true; fi
+  if [[ $had_core == true && $core_active == true ]]; then
+    systemctl start easytier.service >/dev/null 2>&1 || true
+    wait_service_healthy || warn '旧 EasyTier 配置也未能恢复运行，请查看服务状态。'
+  fi
+  if [[ $core_enabled == true ]]; then systemctl enable easytier.service >/dev/null 2>&1 || true; else systemctl disable easytier.service >/dev/null 2>&1 || true; fi
   return 1
 }
 
@@ -728,64 +1129,135 @@ enable_updates() {
   else systemctl disable --now easytier-update.timer >/dev/null 2>&1 || true; fi
 }
 
+show_web_access_info() {
+  local bind port config_proto config_port candidate server_ip='服务器IP'
+  [[ -s $WEB_ARGS_FILE ]] || { info 'Web 控制面板未启用。'; return 0; }
+  bind=$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-addr) || return 1
+  port=$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-port) || return 1
+  config_proto=$(arg_value_from_file "$WEB_ARGS_FILE" --config-server-protocol) || return 1
+  config_port=$(arg_value_from_file "$WEB_ARGS_FILE" --config-server-port) || return 1
+  printf '\n%s\n' '========== Web 控制面板 =========='
+  if [[ $bind == 127.0.0.1 ]]; then
+    printf '面板仅监听本机。请先在自己的电脑终端运行：\n  ssh -L %s:127.0.0.1:%s 用户名@服务器IP\n然后浏览器打开：\n  http://127.0.0.1:%s\n' \
+      "$port" "$port" "$port"
+  else
+    if command -v hostname >/dev/null 2>&1; then
+      for candidate in $(hostname -I 2>/dev/null || true); do
+        if valid_ipv4 "$candidate" && [[ $candidate != 127.* ]]; then server_ip=$candidate; break; fi
+      done
+    fi
+    printf '浏览器打开：http://%s:%s\n' "$server_ip" "$port"
+    warn "请在云安全组或防火墙放行 TCP ${port}，并限制为你自己的来源 IP。"
+  fi
+  printf '登录用户名：admin\n'
+  if [[ -n $WEB_ADMIN_PASSWORD ]]; then printf '本次设置的登录密码：%s\n' "$WEB_ADMIN_PASSWORD"; else printf '登录密码：沿用已有 Web 管理员密码。\n'; fi
+  printf 'Core 本机连接：%s://127.0.0.1:%s/admin（通常不要在安全组放行此端口）\n' "$config_proto" "$config_port"
+}
+
+show_status() {
+  systemctl status easytier.service --no-pager -l || true
+  if [[ -s $WEB_ARGS_FILE || -f $WEB_SERVICE_FILE ]]; then systemctl status easytier-web.service --no-pager -l || true; fi
+}
+
+show_logs() {
+  journalctl -u easytier.service -u easytier-web.service -f
+}
+
+restart_running_services() {
+  local web_active=$1 core_active=$2
+  if [[ $web_active == true ]]; then
+    systemctl reset-failed easytier-web.service >/dev/null 2>&1 || true
+    systemctl restart easytier-web.service || return 1
+    wait_web_healthy || return 1
+  fi
+  if [[ $core_active == true ]]; then
+    systemctl reset-failed easytier.service >/dev/null 2>&1 || true
+    systemctl restart easytier.service || return 1
+    wait_service_healthy || return 1
+  fi
+}
+
 do_install() {
-  local was_active=false
+  local was_active=false web_was_active=false
   need_root; need_systemd; install_tools; acquire_lock
   systemctl is-active --quiet easytier.service && was_active=true
+  systemctl is-active --quiet easytier-web.service && web_was_active=true
   install_binary latest; configure; write_units
   begin_critical_section
   if ! activate_config; then
     if [[ $BINARY_CHANGED == true ]]; then
       rollback_binary
-      if [[ $was_active == true ]]; then
-        systemctl reset-failed easytier.service >/dev/null 2>&1 || true
-        systemctl restart easytier.service >/dev/null 2>&1 || die '文件已回滚，但旧服务重启命令失败。'
-        wait_service_healthy || die '文件已回滚，但旧服务仍未恢复运行。'
-      fi
+      restart_running_services "$web_was_active" "$was_active" || die '文件已回滚，但旧服务仍未恢复运行。'
     fi
     die '新配置启动失败，程序和配置已回滚。'
   fi
   finish_binary_transaction
   end_critical_section
   enable_updates
-  printf '\n常用命令：\n  查看节点：easytier-cli peer\n  查看日志：journalctl -u easytier -f\n  再次配置：sudo easytier-installer --configure\n  手动更新：sudo easytier-installer --update\n'
+  show_web_access_info
+  printf '\n常用命令：\n  查看节点：easytier-cli peer\n  查看状态：sudo easytier-installer --status\n  查看日志：sudo easytier-installer --logs\n  再次配置：sudo easytier-installer --configure\n  手动更新：sudo easytier-installer --update\n'
 }
 
 do_configure() {
+  local was_active=false web_was_active=false arch
   need_root; need_systemd; acquire_lock; [[ -x ${INSTALL_DIR}/easytier-core ]] || die '请先安装 EasyTier。'
+  systemctl is-active --quiet easytier.service && was_active=true
+  systemctl is-active --quiet easytier-web.service && web_was_active=true
+  arch=$(detect_arch)
+  if release_arch_supports_web "$arch" && \
+     [[ ! -x ${INSTALL_DIR}/easytier-web-embed || ! -x ${BIN_DIR}/easytier-web-embed ]]; then
+    info '旧安装缺少 Web 控制面板组件，正在从已校验的官方 Release 补齐。'
+    install_tools; install_binary latest
+  elif [[ ! -x ${INSTALL_DIR}/easytier-web-embed ]]; then
+    warn "上游当前未给 ${arch} 架构提供 Web 控制面板，将继续配置 Core/CLI。"
+  fi
   configure; write_units; begin_critical_section
-  activate_config || die '新配置启动失败，已恢复旧配置。'
+  if ! activate_config; then
+    if [[ $BINARY_CHANGED == true ]]; then
+      rollback_binary
+      restart_running_services "$web_was_active" "$was_active" || die '组件已回滚，但旧服务仍未恢复运行。'
+    fi
+    die '新配置启动失败，已恢复旧配置。'
+  fi
+  finish_binary_transaction
   end_critical_section
+  show_web_access_info
 }
 
 do_update() {
   need_root; need_systemd; install_tools; acquire_lock
   [[ -x ${INSTALL_DIR}/easytier-core ]] || die '尚未安装 EasyTier，请先运行 --install。'
-  local before='' after='' was_active=false
+  local before='' after='' was_active=false web_was_active=false
   [[ -f $VERSION_FILE ]] && before=$(<"$VERSION_FILE")
   systemctl is-active --quiet easytier.service && was_active=true
+  systemctl is-active --quiet easytier-web.service && web_was_active=true
   save_proxy_env; install_binary latest
   [[ -f $VERSION_FILE ]] && after=$(<"$VERSION_FILE")
   begin_critical_section
-  if [[ $BINARY_CHANGED == true && $was_active == true ]]; then
-    if ! systemctl restart easytier.service || ! wait_service_healthy; then
+  if [[ $BINARY_CHANGED == true && ($was_active == true || $web_was_active == true) ]]; then
+    if [[ $web_was_active == true ]] && \
+       { ! systemctl stop easytier-web.service || ! backup_web_database_for_transaction; }; then
+      warn '无法安全备份 Web 账户数据库，正在回滚程序文件。'
+      rollback_binary
+      restart_running_services "$web_was_active" "$was_active" || die '程序已回滚，但旧服务仍未启动。'
+      die '更新失败：未能创建一致的 Web 数据库备份。'
+    fi
+    if ! restart_running_services "$web_was_active" "$was_active"; then
       warn '新版本未能正常启动，正在回滚。'; rollback_binary
-      systemctl reset-failed easytier.service >/dev/null 2>&1 || true
-      systemctl restart easytier.service >/dev/null 2>&1 || die '更新失败，旧版本文件已恢复，但旧服务重启命令也失败。'
-      wait_service_healthy || die '更新失败，旧版本文件已恢复，但服务仍未启动。'
+      restart_running_services "$web_was_active" "$was_active" || die '更新失败，旧版本文件已恢复，但旧服务仍未启动。'
       die '更新失败，已恢复旧版本并重新启动服务。'
     fi
   fi
   finish_binary_transaction
   end_critical_section
   [[ $before == "$after" ]] || ok "已从 ${before:-未知版本} 更新到 ${after}。"
-  [[ $was_active == true ]] || info '服务更新前处于停止状态，因此没有自动启动。'
+  [[ $was_active == true || $web_was_active == true ]] || info '服务更新前处于停止状态，因此没有自动启动。'
 }
 
 do_uninstall() {
   need_root; need_systemd; acquire_lock
-  warn '将停止服务并删除程序、服务文件和自动更新任务。'
-  local keep=true; yesno "保留 ${CONFIG_DIR} 中的配置？" y || keep=false
+  warn '将停止 EasyTier 与 Web 控制面板，并删除程序、服务文件和自动更新任务。'
+  local keep=true; yesno "保留 ${CONFIG_DIR} 中的组网配置、Web 账户和数据库？" y || keep=false
   systemctl stop easytier-update.timer >/dev/null 2>&1 || warn '自动更新计时器停止失败；将继续检查是否有更新任务在运行。'
   if systemctl is-active --quiet easytier-update.service; then
     systemctl stop easytier-update.service || die '自动更新任务停止失败，已中止卸载。'
@@ -796,13 +1268,18 @@ do_uninstall() {
     systemctl stop easytier.service || die 'EasyTier 服务停止失败，未删除任何程序文件。'
   fi
   systemctl is-active --quiet easytier.service && die 'EasyTier 服务仍在运行，已中止卸载。'
-  systemctl disable easytier.service >/dev/null 2>&1 || true
-  rm -f -- "$SERVICE_FILE" "$UPDATE_SERVICE" "$UPDATE_TIMER" "$SELF_PATH" "$RUNNER_PATH" \
-    "${BIN_DIR}/easytier-core" "${BIN_DIR}/easytier-cli" "${INSTALL_DIR}/easytier-core" \
-    "${INSTALL_DIR}/easytier-cli" "$VERSION_FILE"
+  if systemctl is-active --quiet easytier-web.service || systemctl cat easytier-web.service >/dev/null 2>&1 || [[ -f $WEB_SERVICE_FILE ]]; then
+    systemctl stop easytier-web.service || die 'Web 控制面板停止失败，未删除任何程序文件。'
+  fi
+  systemctl is-active --quiet easytier-web.service && die 'Web 控制面板仍在运行，已中止卸载。'
+  systemctl disable easytier.service easytier-web.service >/dev/null 2>&1 || true
+  rm -f -- "$SERVICE_FILE" "$WEB_SERVICE_FILE" "$UPDATE_SERVICE" "$UPDATE_TIMER" "$SELF_PATH" "$RUNNER_PATH" "$WEB_RUNNER_PATH" \
+    "${BIN_DIR}/easytier-core" "${BIN_DIR}/easytier-cli" "${BIN_DIR}/easytier-web-embed" \
+    "${INSTALL_DIR}/easytier-core" "${INSTALL_DIR}/easytier-cli" "${INSTALL_DIR}/easytier-web-embed" "$VERSION_FILE"
   rmdir -- "$INSTALL_DIR" "$(dirname "$RUNNER_PATH")" >/dev/null 2>&1 || true
   if [[ $keep == false ]]; then
-    rm -f -- "$ARGS_FILE" "$INSTALLER_ENV_FILE" "${ARGS_FILE}.new"
+    rm -f -- "$ARGS_FILE" "$WEB_ARGS_FILE" "$INSTALLER_ENV_FILE" "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new" \
+      "$WEB_DB_FILE" "${WEB_DB_FILE}-wal" "${WEB_DB_FILE}-shm" "${WEB_DB_FILE}-journal"
     rmdir -- "$CONFIG_DIR" >/dev/null 2>&1 || warn "${CONFIG_DIR} 中仍有其他文件，已保留该目录。"
   fi
   systemctl daemon-reload; ok 'EasyTier 已卸载。'
@@ -813,14 +1290,15 @@ menu() {
   printf '%s\n' '1) 安装 / 重新安装并配置' '2) 更新到最新版' '3) 重新配置' '4) 查看状态' '5) 实时日志' '6) 卸载' '0) 退出'
   local choice; read -r -p '请选择 [0-6]: ' choice
   case $choice in
-    1) do_install;; 2) do_update;; 3) do_configure;; 4) systemctl status easytier.service --no-pager -l;;
-    5) journalctl -u easytier.service -f;; 6) do_uninstall;; 0) exit 0;; *) die '无效选择。';;
+    1) do_install;; 2) do_update;; 3) do_configure;; 4) show_status;;
+    5) show_logs;; 6) do_uninstall;; 0) exit 0;; *) die '无效选择。';;
   esac
 }
 
 cleanup_main() {
   local rc=$?
   set +e
+  stop_web_bootstrap
   [[ -z $WORK_TMP || ! -d $WORK_TMP ]] || rm -rf -- "$WORK_TMP"
   if ((rc != 0)) && [[ $BINARY_CHANGED == true ]]; then rollback_binary; fi
   return "$rc"
@@ -832,7 +1310,7 @@ main() {
   validate_runtime_paths
   case ${1:-} in
     --install) do_install;; --update) do_update;; --configure) do_configure;; --uninstall) do_uninstall;;
-    --status) systemctl status easytier.service --no-pager -l;; --logs) journalctl -u easytier.service -f;;
+    --status) show_status;; --logs) show_logs;;
     -h|--help) echo "用法：sudo bash $0 [--install|--update|--configure|--status|--logs|--uninstall]";;
     '') menu;; *) die "未知参数：$1（使用 --help 查看帮助）";;
   esac

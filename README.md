@@ -1,6 +1,6 @@
 # EasyTier 中文一键安装与自动更新脚本
 
-面向新手的 Linux / systemd 交互式安装器。脚本会识别 CPU 架构，安装 [EasyTier 官方 Release](https://github.com/EasyTier/EasyTier/releases) 的最新稳定版，并逐步询问组网、监听协议、端口、连接节点、子网代理等参数。
+面向新手的 Linux / systemd 交互式安装器。脚本会识别 CPU 架构，安装 [EasyTier 官方 Release](https://github.com/EasyTier/EasyTier/releases) 的最新稳定版和官方 Web 控制面板，并逐步询问组网、监听协议、端口、连接节点、子网代理、Web 访问范围等参数。
 
 ## 一键安装
 
@@ -14,7 +14,7 @@ curl --disable -fsSL https://raw.githubusercontent.com/a15525082844-gif/easytier
 
 ```bash
 curl --disable -fL https://v4.gh-proxy.org/https://raw.githubusercontent.com/a15525082844-gif/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh
-echo '98b7c1254e756a88fca8198de52e420c91238f8c1fda60df5071f983df698c80  easytier-installer.sh' | sha256sum -c -
+echo '421c8fc4921bee7cee103b4a185e0f21286e56bf535ea0d9ee55ecd716c57b14  easytier-installer.sh' | sha256sum -c -
 less easytier-installer.sh
 # 确认脚本内容后再执行：
 sudo bash easytier-installer.sh --install
@@ -51,9 +51,37 @@ EASYTIER_GITHUB_PROXY=https://你的代理地址 sudo -E bash easytier-installer
 - 主动连接节点：例如 `tcp://1.2.3.4:11010`；多个地址用逗号分隔。
 - 公共共享节点：只填写你信任的共享节点，不清楚时可留空。
 - 子网代理、SOCKS5、WireGuard 入口：没有明确需要时都可留空或选“否”。
+- Web 控制面板：默认启用；访问范围直接回车选择“仅本机”，可通过 SSH 隧道安全访问。需要从局域网或公网直接打开时选择 `2`。
+- Web 登录密码：首次启用时会明文显示一个随机默认密码，直接回车即可使用；登录用户名固定为 `admin`。
 - 高级参数：每行输入一个 EasyTier 原生参数或参数值，直接回车结束。
 
 TCP 与 UDP 可以使用相同数字端口；同为 TCP 或同为 UDP 的协议不能占用同一端口。使用云服务器时，还要在防火墙或安全组中放行相应的 TCP/UDP 端口。
+
+## Web 控制面板
+
+安装器使用上游发行包中的 `easytier-web-embed`，同时提供网页、API 和配置下发服务。首次启用时，安装器会先把面板临时限制在 `127.0.0.1`，自动完成以下安全初始化，全部成功后才正式启动：
+
+1. 把上游内置 `admin` 账户的默认密码改为向导中显示的新密码。
+2. 把内置 `user` 账户的默认密码改成不可预测的随机值。
+3. 关闭网页自助注册。
+4. 使用新密码重新登录验证，并检查 Web 服务能持续运行。
+
+默认端口如下，向导中都可以修改：
+
+- `11211/TCP`：网页与 API。
+- `22020/UDP`：本机 EasyTier Core 接入控制面板的配置下发端口，也可改为 TCP 或 WS。
+
+选择“仅本机”后，安装完成会打印 SSH 隧道命令。先在自己的电脑运行该命令，再打开 `http://127.0.0.1:11211`。选择“局域网 / 公网直接访问”后，打开 `http://服务器IP:11211`，并只放行 `11211/TCP` 给可信来源；仅管理同机 Core 时通常不要在安全组放行配置下发端口。
+
+面板自身只提供 HTTP。若需长期从公网访问，请限制来源 IP，并使用 Nginx、Caddy 等反向代理配置 HTTPS。Web 账户数据库保存在 `/etc/easytier/web.db`，重新配置和更新都会保留已有密码。
+
+旧版脚本已经安装过 EasyTier、但缺少 Web 组件时，下载本仓库最新版脚本并执行：
+
+```bash
+sudo bash easytier-installer.sh --configure
+```
+
+脚本会从经过官方 SHA-256 校验的 Release 自动补齐 Web 组件，然后进入向导。
 
 ## 安装后的命令
 
@@ -73,7 +101,7 @@ sudo easytier-installer --update
 sudo easytier-installer --uninstall
 ```
 
-配置保存在 `/etc/easytier/config.args`，权限为 `0600`；程序位于 `/opt/easytier`。重新配置会真正重启服务，新配置启动失败时自动恢复旧配置。
+组网配置保存在 `/etc/easytier/config.args`，Web 启动参数保存在 `/etc/easytier/web.args`，权限均为 `0600`；程序位于 `/opt/easytier`。重新配置会真正重启 Core 和 Web 服务，新配置启动失败时自动恢复旧配置。
 
 ## 自动更新与回滚
 
@@ -84,7 +112,7 @@ sudo easytier-installer --uninstall
 3. 从最快线路开始下载；低速、超时或下载失败会快速切换下一条。
 4. 先比对官方 SHA-256，再检查 ZIP，校验不符会丢弃并换线路。
 5. 仅在版本变化时替换程序；原服务原本停止时不会擅自启动。
-6. 更新后服务无法正常运行时，自动恢复旧程序和版本号。
+6. 更新前对停止后的 Web 数据库做一致备份；Core 或 Web 启动失败时，自动恢复旧程序、版本号和 Web 数据库。
 
 出于 root 供应链安全考虑，定时任务不会从可变的 `main` 分支静默替换管理脚本本身。要取得本仓库的新脚本，请重新执行上方 GitHub 官方线路的下载命令并查看变更。
 
@@ -98,7 +126,9 @@ EASYTIER_VERSION=v2.6.4 EASYTIER_SHA256=64位十六进制摘要 sudo -E bash eas
 
 - 使用 systemd 的常见 Linux：Debian、Ubuntu、CentOS、Rocky、AlmaLinux、Fedora、Arch、Alpine 等。
 - x86_64、aarch64、arm/armhf、armv7/armv7hf、riscv64、loongarch64、mips、mipsel。
-- 仅安装上游 Release 中的 `easytier-core` 和 `easytier-cli`。
+- 安装上游 Release 中的 `easytier-core`、`easytier-cli` 和（该架构提供时）`easytier-web-embed`。
+
+上游 v2.6.4 的 MIPS / MIPSel 发行包未包含 `easytier-web-embed`，因此这两个架构只安装 Core/CLI，并在向导中明确提示；其余上述 Linux 架构可启用 Web 面板。
 
 Windows、macOS、OpenWrt 请使用 EasyTier 官方对应安装包或插件。
 
@@ -110,5 +140,7 @@ Windows、macOS、OpenWrt 请使用 EasyTier 官方对应安装包或插件。
 - 网络密钥不写入 systemd unit，但 EasyTier 以命令行参数启动；root 用户仍可从进程信息读取它。
 - 公共共享节点能够中继流量，应只选择可信节点并使用足够强的网络密钥。
 - RPC 只监听 `127.0.0.1`。公开 SOCKS5、WireGuard 或子网代理会扩大可访问范围，不需要时不要开启。
+- Web 面板首次启用会替换两个上游默认账户密码并关闭注册；已有数据库不会被重置。请妥善保存 `admin` 密码。
+- Web 面板直接对外提供的是 HTTP，不应无来源限制地暴露到公网；推荐仅本机监听并使用 SSH 隧道，或在可信反向代理后启用 HTTPS。
 
 上游项目：[EasyTier/EasyTier](https://github.com/EasyTier/EasyTier) · [EasyTier 中文网站](https://easytier.cn/)

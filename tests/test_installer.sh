@@ -10,6 +10,7 @@ export EASYTIER_CONFIG_DIR="$TEST_ROOT/etc/easytier"
 export EASYTIER_SYSTEMD_DIR="$TEST_ROOT/systemd"
 export EASYTIER_SELF_PATH="$TEST_ROOT/sbin/easytier-installer"
 export EASYTIER_RUNNER_PATH="$TEST_ROOT/lib/easytier/run"
+export EASYTIER_WEB_RUNNER_PATH="$TEST_ROOT/lib/easytier/run-web"
 export EASYTIER_MAX_ASSET_BYTES=64
 
 # shellcheck disable=SC1091
@@ -40,6 +41,12 @@ for ip in 0.0.0.0 10.126.126.2 255.255.255.255; do assert_ok valid_ipv4 "$ip"; d
 for ip in 256.1.1.1 1.2.3 1.2.3.4.5 a.b.c.d; do assert_fail valid_ipv4 "$ip"; done
 assert_ok valid_port 1; assert_ok valid_port 65535
 assert_fail valid_port 0; assert_fail valid_port 011010; assert_fail valid_port 65536; assert_fail valid_port 999999999999999999999; assert_fail valid_port abc
+assert_ok valid_web_password 'et-0123456789abcdef1234'
+assert_ok valid_web_password 'Strong_Web-Password:2026!'
+assert_fail valid_web_password 'too-short'
+assert_fail valid_web_password 'password with spaces'
+assert_fail valid_web_password 'password"with-quote'
+assert_eq "$(md5_hex admin)" '21232f297a57a5a743894a0e4a801fc3'
 assert_ok valid_ipv4_cidr 10.14.14.0/24
 assert_ok valid_ipv4_cidr 10.14.14.1/32
 assert_fail valid_ipv4_cidr 10.14.14.1/24
@@ -50,6 +57,10 @@ assert_eq "$(protocol_family faketcp)" tcp
 assert_eq "$(protocol_family quic)" udp
 assert_eq "$(protocol_default_port ws)" 11011
 assert_eq "$(protocol_default_port quic)" 11012
+assert_ok release_arch_supports_web x86_64
+assert_ok release_arch_supports_web aarch64
+assert_fail release_arch_supports_web mips
+assert_fail release_arch_supports_web mipsel
 assert_ok valid_proxy 'https://proxy.example/prefix'
 assert_fail valid_proxy 'http://proxy.example'
 assert_fail valid_proxy $'https://proxy.example/\nBAD=1'
@@ -74,6 +85,12 @@ assert_eq "$("$TEST_ROOT/self/dest.sh")" ok
 assert_ok install_self "$TEST_ROOT/self/dest.sh" "$TEST_ROOT/self/dest.sh"
 
 mkdir -p "$EASYTIER_CONFIG_DIR"
+printf '%s\n' '--api-server-addr' '127.0.0.1' '--api-server-port' '11211' \
+  '--config-server-protocol' 'udp' '--config-server-port' '22020' > "$WEB_ARGS_FILE"
+assert_eq "$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-addr)" '127.0.0.1'
+assert_eq "$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-port)" '11211'
+assert_fail arg_value_from_file "$WEB_ARGS_FILE" --missing
+rm -f -- "$WEB_ARGS_FILE"
 printf '%s\n' '--network-name' 'name with spaces' > "${ARGS_FILE}.new"
 cat > "$TEST_ROOT/fake-core" <<'EOF'
 #!/usr/bin/env bash
@@ -90,6 +107,21 @@ assert_fail validate_config_candidate "$TEST_ROOT/fake-core"
 ((pass+=1))
 
 mkdir -p "$INSTALL_DIR"
+cp "$TEST_ROOT/fake-core" "$INSTALL_DIR/easytier-core"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$INSTALL_DIR/easytier-web-embed"
+chmod +x "$INSTALL_DIR/easytier-web-embed"
+hostname() { printf 'test-host\n'; }
+configure </dev/null
+assert_eq "$WEB_ENABLED" true
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --config-server)" 'udp://127.0.0.1:22020/admin'
+assert_eq "$(arg_value_from_file "${WEB_ARGS_FILE}.new" --api-server-addr)" '127.0.0.1'
+assert_eq "$(arg_value_from_file "${WEB_ARGS_FILE}.new" --api-server-port)" '11211'
+assert_eq "$(arg_value_from_file "${WEB_ARGS_FILE}.new" --config-server-port)" '22020'
+grep -Fx -- '--disable-registration' "${WEB_ARGS_FILE}.new" >/dev/null || fail 'web registration was not disabled'
+((pass+=1))
+[[ $WEB_ADMIN_PASSWORD =~ ^et-[0-9a-fA-F]{20}$ ]] || fail "invalid default web password: $WEB_ADMIN_PASSWORD"
+((pass+=1))
+rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new"
 cat > "$INSTALL_DIR/easytier-cli" <<'EOF'
 #!/usr/bin/env bash
 if [[ ${NODE_MODE:-good} == good ]]; then
@@ -131,6 +163,73 @@ systemctl() {
   esac
 }
 sleep() { :; }
+assert_ok write_units
+assert_ok grep -F "ConditionPathExists=${WEB_ARGS_FILE}" "$WEB_SERVICE_FILE"
+assert_ok grep -F 'exec '"${INSTALL_DIR}"'/easytier-web-embed' "$WEB_RUNNER_PATH"
+assert_ok grep -F 'After=network-online.target easytier-web.service' "$SERVICE_FILE"
+assert_ok grep -Fx 'CapabilityBoundingSet=CAP_NET_BIND_SERVICE' "$WEB_SERVICE_FILE"
+
+cat > "$INSTALL_DIR/easytier-web-embed" <<'EOF'
+#!/usr/bin/env bash
+while (($#)); do
+  if [[ $1 == --db ]]; then shift; printf 'mock-db\n' > "$1"; fi
+  shift
+done
+trap 'exit 0' TERM INT
+while :; do sleep 60; done
+EOF
+chmod +x "$INSTALL_DIR/easytier-web-embed"
+printf '%s\n' '--db' "$WEB_DB_FILE" '--api-server-addr' '0.0.0.0' '--api-server-port' '11211' \
+  '--config-server-protocol' 'udp' '--config-server-port' '22020' '--disable-registration' > "${WEB_ARGS_FILE}.new"
+WEB_ENABLED=true
+WEB_ADMIN_PASSWORD='Strong_Web-Password:2026!'
+WEB_BOOTSTRAP_BODY_LOG="$TEST_ROOT/web-bootstrap-body.log"
+WEB_BOOTSTRAP_ARG_LOG="$TEST_ROOT/web-bootstrap-args.log"
+: > "$WEB_BOOTSTRAP_BODY_LOG"; : > "$WEB_BOOTSTRAP_ARG_LOG"
+# shellcheck disable=SC2329 # Invoked indirectly by bootstrap_web_admin_password from the sourced installer.
+curl() {
+  local arg cookie='' url='' has_body=false write_status=false body=''
+  printf '%s\n' "$@" >> "$WEB_BOOTSTRAP_ARG_LOG"
+  while (($#)); do
+    arg=$1
+    case $arg in
+      -c) shift; cookie=${1-};;
+      --data-binary) shift; [[ ${1-} == @- ]] && has_body=true;;
+      -w) shift; write_status=true;;
+      http://*) url=$arg;;
+    esac
+    shift || true
+  done
+  [[ -z $cookie ]] || : > "$cookie"
+  if [[ $has_body == true ]]; then body=$(cat); printf '%s\n' "$body" >> "$WEB_BOOTSTRAP_BODY_LOG"; fi
+  if [[ $url == */auth/captcha && ! -e $WEB_DB_FILE ]]; then printf 'mock-db\n' > "$WEB_DB_FILE"; fi
+  [[ $write_status != true ]] || printf '200'
+}
+assert_ok bootstrap_web_admin_password
+[[ -s $WEB_DB_FILE ]] || fail 'web bootstrap did not create its database'
+((pass+=1))
+assert_eq "$(wc -l < "$WEB_BOOTSTRAP_BODY_LOG" | tr -d ' ')" 6
+assert_ok grep -F "$(md5_hex "$WEB_ADMIN_PASSWORD")" "$WEB_BOOTSTRAP_BODY_LOG"
+assert_ok grep -F 'ee11cbb19052e40b07aac0ca060c23ee' "$WEB_BOOTSTRAP_BODY_LOG"
+assert_ok grep -Fx -- '--noproxy' "$WEB_BOOTSTRAP_ARG_LOG"
+if grep -F "$WEB_ADMIN_PASSWORD" "$WEB_BOOTSTRAP_BODY_LOG" >/dev/null; then fail 'raw web password was sent to curl'; fi
+((pass+=1))
+rm -f -- "$WEB_DB_FILE" "${WEB_ARGS_FILE}.new" "$INSTALL_DIR/easytier-web-embed" \
+  "$WEB_BOOTSTRAP_BODY_LOG" "$WEB_BOOTSTRAP_ARG_LOG"
+
+BINARY_CHANGED=true
+BINARY_ROLLBACK_DIR="$TEST_ROOT/web-db-rollback"
+mkdir -p "$BINARY_ROLLBACK_DIR"
+printf 'old-db\n' > "$WEB_DB_FILE"
+assert_ok backup_web_database_for_transaction
+printf 'migrated-db\n' > "$WEB_DB_FILE"
+assert_ok restore_web_database_from_transaction
+assert_eq "$(<"$WEB_DB_FILE")" 'old-db'
+rm -rf -- "$BINARY_ROLLBACK_DIR"; rm -f -- "$WEB_DB_FILE"
+BINARY_CHANGED=false; BINARY_ROLLBACK_DIR=''
+[[ $BINARY_CHANGED == false && -z $BINARY_ROLLBACK_DIR ]] || fail 'binary transaction test state was not reset'
+((pass+=1))
+
 assert_ok start_service_checked
 grep -Fx 'enable easytier.service' "$MOCK_LOG" >/dev/null || fail 'service was not enabled'
 grep -Fx 'restart easytier.service' "$MOCK_LOG" >/dev/null || fail 'active service was not restarted'
