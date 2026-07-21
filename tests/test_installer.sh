@@ -47,6 +47,9 @@ assert_fail valid_web_password 'too-short'
 assert_fail valid_web_password 'password with spaces'
 assert_fail valid_web_password 'password"with-quote'
 assert_eq "$(md5_hex admin)" '21232f297a57a5a743894a0e4a801fc3'
+assert_ok valid_web_db_password_hash "\$argon2i\$v=19\$m=16,t=2,p=1\$bW5idXl0cmY\$61n+JxL4r3dwLPAEDlDdtg"
+assert_ok valid_web_db_password_hash "\$argon2id\$v=19\$m=19456,t=2,p=1\$c2FsdA\$YWJjZGVmZ2hpamtsbW5vcA"
+assert_fail valid_web_db_password_hash "\$argon2id\$bad-or-quoted'hash"
 assert_ok valid_ipv4_cidr 10.14.14.0/24
 assert_ok valid_ipv4_cidr 10.14.14.1/32
 assert_fail valid_ipv4_cidr 10.14.14.1/24
@@ -216,6 +219,7 @@ assert_ok grep -Fx 'CapabilityBoundingSet=CAP_NET_BIND_SERVICE' "$WEB_SERVICE_FI
 
 cat > "$INSTALL_DIR/easytier-web-embed" <<'EOF'
 #!/usr/bin/env bash
+[[ -z ${WEB_FAKE_ARG_LOG:-} ]] || printf '%s\n' "$@" >> "$WEB_FAKE_ARG_LOG"
 while (($#)); do
   if [[ $1 == --db ]]; then shift; printf 'mock-db\n' > "$1"; fi
   shift
@@ -230,10 +234,11 @@ WEB_ENABLED=true
 WEB_ADMIN_PASSWORD='Strong_Web-Password:2026!'
 WEB_BOOTSTRAP_BODY_LOG="$TEST_ROOT/web-bootstrap-body.log"
 WEB_BOOTSTRAP_ARG_LOG="$TEST_ROOT/web-bootstrap-args.log"
-: > "$WEB_BOOTSTRAP_BODY_LOG"; : > "$WEB_BOOTSTRAP_ARG_LOG"
+export WEB_FAKE_ARG_LOG="$TEST_ROOT/web-run-args.log"
+: > "$WEB_BOOTSTRAP_BODY_LOG"; : > "$WEB_BOOTSTRAP_ARG_LOG"; : > "$WEB_FAKE_ARG_LOG"
 # shellcheck disable=SC2317,SC2329 # Invoked indirectly by bootstrap_web_admin_password from the sourced installer.
 curl() {
-  local arg cookie='' url='' has_body=false write_status=false body=''
+  local arg cookie='' url='' has_body=false write_status=false body='' expected_db=''
   printf '%s\n' "$@" >> "$WEB_BOOTSTRAP_ARG_LOG"
   while (($#)); do
     arg=$1
@@ -247,7 +252,8 @@ curl() {
   done
   [[ -z $cookie ]] || : > "$cookie"
   if [[ $has_body == true ]]; then body=$(cat); printf '%s\n' "$body" >> "$WEB_BOOTSTRAP_BODY_LOG"; fi
-  if [[ $url == */auth/captcha && ! -e $WEB_DB_FILE ]]; then printf 'mock-db\n' > "$WEB_DB_FILE"; fi
+  expected_db=${WEB_BOOTSTRAP_EXPECTED_DB:-$WEB_DB_FILE}
+  if [[ $url == */auth/captcha && ! -e $expected_db ]]; then printf 'mock-db\n' > "$expected_db"; fi
   [[ $write_status != true ]] || printf '200'
 }
 assert_ok bootstrap_web_admin_password
@@ -259,8 +265,68 @@ assert_ok grep -F 'ee11cbb19052e40b07aac0ca060c23ee' "$WEB_BOOTSTRAP_BODY_LOG"
 assert_ok grep -Fx -- '--noproxy' "$WEB_BOOTSTRAP_ARG_LOG"
 if grep -F "$WEB_ADMIN_PASSWORD" "$WEB_BOOTSTRAP_BODY_LOG" >/dev/null; then fail 'raw web password was sent to curl'; fi
 ((pass+=1))
+
+MOCK_DB_HASH="\$argon2id\$v=19\$m=19456,t=2,p=1\$c2FsdHNhbHQ\$YWJjZGVmZ2hpamtsbW5vcHFycw"
+SQLITE_LOG="$TEST_ROOT/sqlite.log"
+: > "$SQLITE_LOG"; : > "$WEB_BOOTSTRAP_BODY_LOG"; : > "$WEB_FAKE_ARG_LOG"
+# shellcheck disable=SC2317,SC2329 # Invoked by password-reset helpers under test.
+sqlite3() {
+  local sql=${!#} destination=''
+  [[ $sql != "$WEB_DB_FILE" ]] || sql=$(cat)
+  printf '%s %s\n' "$*" "$sql" >> "$SQLITE_LOG"
+  case $sql in
+    'PRAGMA integrity_check;') printf 'ok\n';;
+    ".backup '"*)
+      destination=${sql#".backup '"}; destination=${destination%"'"}
+      cp "$WEB_DB_FILE" "$destination"
+      ;;
+    *"SELECT COUNT(*) FROM users WHERE username='admin';"*) printf '1\n';;
+    *"SELECT password FROM users WHERE username='admin';"*) printf '%s\n' "$MOCK_DB_HASH";;
+    *'BEGIN IMMEDIATE; UPDATE users SET password='*) printf '1\n';;
+    *) return 1;;
+  esac
+}
+
+reset_seed_db="$TEST_ROOT/reset-seed.db"
+reset_log="$TEST_ROOT/reset-web.log"
+reset_cookie="$TEST_ROOT/reset-cookie"
+WEB_BOOTSTRAP_EXPECTED_DB=$reset_seed_db
+assert_ok generate_web_admin_db_hash 'Another_Web-Password:2026!' "$reset_seed_db" 45111 udp 45220 "$reset_log" "$reset_cookie"
+unset WEB_BOOTSTRAP_EXPECTED_DB
+assert_eq "$WEB_RESET_DB_HASH" "$MOCK_DB_HASH"
+assert_eq "$(arg_value_from_file "$WEB_FAKE_ARG_LOG" --api-server-addr)" '127.0.0.1'
+assert_ok grep -Fx -- '--disable-registration' "$WEB_FAKE_ARG_LOG"
+assert_eq "$(wc -l < "$WEB_BOOTSTRAP_BODY_LOG" | tr -d ' ')" 3
+assert_ok grep -F "$WEB_DEFAULT_ADMIN_LOGIN_HASH" "$WEB_BOOTSTRAP_BODY_LOG"
+assert_ok grep -F "$(md5_hex 'Another_Web-Password:2026!')" "$WEB_BOOTSTRAP_BODY_LOG"
+if grep -F 'Another_Web-Password:2026!' "$WEB_BOOTSTRAP_BODY_LOG" >/dev/null; then fail 'raw reset password was sent to curl'; fi
+((pass+=1))
+
+printf 'old-db\n' > "$WEB_DB_FILE"
+assert_ok backup_web_password_database "$TEST_ROOT/reset-backup.db"
+assert_eq "$(<"$TEST_ROOT/reset-backup.db")" 'old-db'
+assert_ok replace_web_admin_db_hash "$MOCK_DB_HASH"
+assert_ok grep -F "UPDATE users SET password='${MOCK_DB_HASH}'" "$SQLITE_LOG"
+printf 'changed-db\n' > "$WEB_DB_FILE"
+printf 'stale-sidecar\n' > "${WEB_DB_FILE}-wal"
+# shellcheck disable=SC2034 # Read inside the sourced restore_web_password_database helper.
+PASSWORD_RESET_BACKUP_FILE="$TEST_ROOT/reset-backup.db"
+# shellcheck disable=SC2034 # Read inside the sourced restore_web_password_database helper.
+PASSWORD_RESET_WAS_ACTIVE=false
+MOCK_ACTIVE=false
+# shellcheck disable=SC2317,SC2329 # Called by restore_web_password_database under test.
+chown() { :; }
+assert_ok restore_web_password_database
+assert_eq "$(<"$WEB_DB_FILE")" 'old-db'
+[[ ! -e ${WEB_DB_FILE}-wal ]] || fail 'password rollback left a stale WAL sidecar'
+((pass+=1))
+unset -f chown
+assert_ok clear_web_password_reset_state
+MOCK_ACTIVE=true
+unset -f sqlite3
 rm -f -- "$WEB_DB_FILE" "${WEB_ARGS_FILE}.new" "$INSTALL_DIR/easytier-web-embed" \
-  "$WEB_BOOTSTRAP_BODY_LOG" "$WEB_BOOTSTRAP_ARG_LOG"
+  "$WEB_BOOTSTRAP_BODY_LOG" "$WEB_BOOTSTRAP_ARG_LOG" "$SQLITE_LOG" "$reset_seed_db" \
+  "$reset_log" "$reset_cookie" "$TEST_ROOT/reset-backup.db" "$WEB_FAKE_ARG_LOG"
 
 BINARY_CHANGED=true
 BINARY_ROLLBACK_DIR="$TEST_ROOT/web-db-rollback"
