@@ -30,6 +30,7 @@ readonly UPDATE_SERVICE="${SYSTEMD_DIR}/easytier-update.service"
 readonly UPDATE_TIMER="${SYSTEMD_DIR}/easytier-update.timer"
 readonly API_ROOT="https://api.github.com/repos/${REPO}/releases"
 readonly RELEASES_URL="https://github.com/${REPO}/releases"
+readonly WEB_DEFAULT_ADMIN_LOGIN_HASH='21232f297a57a5a743894a0e4a801fc3'
 readonly LOCK_DIR=/run/easytier-installer
 readonly LOCK_FILE=${LOCK_DIR}/lock
 
@@ -41,6 +42,11 @@ LOCK_HELD=false
 WEB_ENABLED=false
 WEB_ADMIN_PASSWORD=''
 WEB_BOOTSTRAP_PID=''
+WEB_RESET_DB_HASH=''
+PASSWORD_RESET_ACTIVE=false
+PASSWORD_RESET_BACKUP_FILE=''
+PASSWORD_RESET_TEMP_DIR=''
+PASSWORD_RESET_WAS_ACTIVE=false
 ERROR_MESSAGE_SHOWN=false
 
 umask 077
@@ -92,6 +98,19 @@ install_tools() {
   elif command -v apk >/dev/null 2>&1; then apk add --no-cache curl unzip coreutils ca-certificates flock
   elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm curl unzip coreutils ca-certificates util-linux
   else die "无法识别包管理器，请先安装 curl、unzip、sha256sum。"; fi
+}
+
+install_sqlite_tool() {
+  command -v sqlite3 >/dev/null 2>&1 && return 0
+  info '重置 Web 密码需要 sqlite3，正在安装……'
+  if command -v apt-get >/dev/null 2>&1; then
+    if ! apt-get update || ! DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3; then die 'sqlite3 安装失败。'; fi
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y sqlite || die 'sqlite3 安装失败。'
+  elif command -v yum >/dev/null 2>&1; then yum install -y sqlite || die 'sqlite3 安装失败。'
+  elif command -v apk >/dev/null 2>&1; then apk add --no-cache sqlite || die 'sqlite3 安装失败。'
+  elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm sqlite || die 'sqlite3 安装失败。'
+  else die '无法识别包管理器，请先安装 sqlite3 后重试。'; fi
+  command -v sqlite3 >/dev/null 2>&1 || die 'sqlite3 安装完成后仍不可用。'
 }
 
 detect_arch() {
@@ -1033,6 +1052,208 @@ bootstrap_web_admin_password() {
   ok 'Web 内置默认密码均已替换，自助注册已关闭。'
 }
 
+valid_web_db_password_hash() {
+  ((${#1} >= 32 && ${#1} <= 512)) &&
+    [[ $1 =~ ^\$argon2(id|i|d)\$v=[0-9]+\$m=[0-9]+,t=[0-9]+,p=[0-9]+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+$ ]]
+}
+
+sqlite_integrity_ok() {
+  local db=$1 result=''
+  [[ -f $db && ! -L $db ]] || return 1
+  result=$(sqlite3 -batch -bail -cmd '.timeout 5000' "$db" 'PRAGMA integrity_check;' 2>/dev/null) || return 1
+  [[ $result == ok ]]
+}
+
+backup_web_password_database() {
+  local destination=$1
+  [[ -s $WEB_DB_FILE && ! -e $destination ]] || return 1
+  sqlite_integrity_ok "$WEB_DB_FILE" || return 1
+  sqlite3 -batch -bail -cmd '.timeout 5000' "$WEB_DB_FILE" ".backup '${destination}'" >/dev/null || return 1
+  [[ -s $destination && ! -L $destination ]] || return 1
+  chmod 0600 "$destination" || return 1
+  sqlite_integrity_ok "$destination"
+}
+
+restore_web_password_database() {
+  local backup=$PASSWORD_RESET_BACKUP_FILE staging="${WEB_DB_FILE}.password-reset-restore"
+  [[ -s $backup && ! -L $backup ]] || return 1
+  stop_web_bootstrap
+  systemctl stop easytier-web.service >/dev/null 2>&1 || true
+  systemctl is-active --quiet easytier-web.service && return 1
+  rm -f -- "$staging"
+  cp -a -- "$backup" "$staging" || return 1
+  chmod 0600 "$staging" || return 1
+  chown root:root "$staging" || return 1
+  sqlite_integrity_ok "$staging" || return 1
+  rm -f -- "${WEB_DB_FILE}-wal" "${WEB_DB_FILE}-shm" "${WEB_DB_FILE}-journal" || return 1
+  mv -f -- "$staging" "$WEB_DB_FILE" || return 1
+  if [[ $PASSWORD_RESET_WAS_ACTIVE == true ]]; then
+    systemctl reset-failed easytier-web.service >/dev/null 2>&1 || true
+    systemctl start easytier-web.service || return 1
+    wait_web_healthy || return 1
+  fi
+}
+
+clear_web_password_reset_state() {
+  local temp=$PASSWORD_RESET_TEMP_DIR
+  PASSWORD_RESET_ACTIVE=false
+  PASSWORD_RESET_BACKUP_FILE=''
+  PASSWORD_RESET_TEMP_DIR=''
+  PASSWORD_RESET_WAS_ACTIVE=false
+  WEB_RESET_DB_HASH=''
+  if [[ -n $temp ]]; then
+    case $temp in
+      "${CONFIG_DIR}"/.password-reset.*) rm -rf -- "$temp" || warn "无法清理密码重置临时目录：${temp}";;
+      *) warn "拒绝清理异常的密码重置临时目录：${temp}";;
+    esac
+  fi
+  return 0
+}
+
+restore_web_active_state_without_db_change() {
+  local should_be_active=$1
+  if [[ $should_be_active == true ]]; then
+    if ! systemctl is-active --quiet easytier-web.service; then
+      systemctl reset-failed easytier-web.service >/dev/null 2>&1 || true
+      systemctl start easytier-web.service || return 1
+      wait_web_healthy || return 1
+    fi
+  elif systemctl is-active --quiet easytier-web.service; then
+    systemctl stop easytier-web.service || return 1
+    systemctl is-active --quiet easytier-web.service && return 1
+  fi
+}
+
+abort_web_password_reset() {
+  local reason=$1 backup=$PASSWORD_RESET_BACKUP_FILE temp=$PASSWORD_RESET_TEMP_DIR
+  warn "${reason}，正在恢复原 Web 账户数据库。"
+  if restore_web_password_database; then
+    clear_web_password_reset_state
+    end_critical_section
+    die "${reason}，已恢复原密码和服务状态。"
+  fi
+  PASSWORD_RESET_ACTIVE=false
+  PASSWORD_RESET_BACKUP_FILE=''
+  PASSWORD_RESET_TEMP_DIR=''
+  PASSWORD_RESET_WAS_ACTIVE=false
+  WEB_RESET_DB_HASH=''
+  end_critical_section
+  die "${reason}，且自动恢复未完成。请勿删除备份：${backup}；诊断目录：${temp}"
+}
+
+validate_web_password_reset_paths() {
+  local db_arg='' db_flags=''
+  [[ -d $CONFIG_DIR && ! -L $CONFIG_DIR ]] || die "配置目录不存在或不安全：${CONFIG_DIR}"
+  [[ $(stat -c '%u' "$CONFIG_DIR") == 0 ]] || die "配置目录不属于 root：${CONFIG_DIR}"
+  [[ -f $WEB_ARGS_FILE && ! -L $WEB_ARGS_FILE ]] || die "Web 启动参数不存在或不是普通文件：${WEB_ARGS_FILE}"
+  [[ -s $WEB_DB_FILE && -f $WEB_DB_FILE && ! -L $WEB_DB_FILE ]] || die "Web 账户数据库不存在或不是普通文件：${WEB_DB_FILE}"
+  [[ $(stat -c '%u' "$WEB_ARGS_FILE") == 0 && $(stat -c '%u' "$WEB_DB_FILE") == 0 ]] || \
+    die 'Web 参数或账户数据库不属于 root，拒绝修改。'
+  [[ -x ${INSTALL_DIR}/easytier-web-embed ]] || die '未找到 Web 控制面板程序，请先运行 --update 或 --configure。'
+  db_flags=$(grep -Fxc -- '--db' "$WEB_ARGS_FILE" || true)
+  [[ $db_flags == 1 ]] || die 'web.args 中必须且只能有一个 --db 参数，拒绝修改。'
+  db_arg=$(arg_value_from_file "$WEB_ARGS_FILE" --db 2>/dev/null || true)
+  [[ $db_arg == "$WEB_DB_FILE" ]] || die "Web 服务使用的数据库不是 ${WEB_DB_FILE}，拒绝修改。"
+  chmod 0700 "$CONFIG_DIR"
+  chmod 0600 "$WEB_ARGS_FILE" "$WEB_DB_FILE"
+}
+
+start_local_web_for_password_reset() {
+  local db=$1 api_port=$2 config_proto=$3 config_port=$4 log=$5 ready=false i
+  : > "$log"; chmod 0600 "$log"
+  "${INSTALL_DIR}/easytier-web-embed" \
+    --db "$db" \
+    --api-server-addr 127.0.0.1 \
+    --api-server-port "$api_port" \
+    --config-server-protocol "$config_proto" \
+    --config-server-port "$config_port" \
+    --disable-registration \
+    --console-log-level info >"$log" 2>&1 &
+  WEB_BOOTSTRAP_PID=$!
+  for ((i=0; i<30; i++)); do
+    if curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 4 \
+        "http://127.0.0.1:${api_port}/api/v1/auth/captcha" -o /dev/null 2>/dev/null; then
+      ready=true; break
+    fi
+    kill -0 "$WEB_BOOTSTRAP_PID" 2>/dev/null || break
+    sleep 1
+  done
+  if [[ $ready != true ]]; then
+    warn '本机临时 Web 实例启动失败。日志如下：'
+    sed -n '1,80p' "$log" >&2 || true
+    return 1
+  fi
+  return 0
+}
+
+local_web_login() {
+  local api_port=$1 password_hash=$2 cookie=$3
+  rm -f -- "$cookie"
+  printf '{"username":"admin","password":"%s"}' "$password_hash" | \
+    curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 8 \
+      -c "$cookie" -H 'Content-Type: application/json' --data-binary @- \
+      "http://127.0.0.1:${api_port}/api/v1/auth/login" -o /dev/null
+}
+
+generate_web_admin_db_hash() {
+  local password=$1 db=$2 api_port=$3 config_proto=$4 config_port=$5 log=$6 cookie=$7
+  local new_login_hash='' count='' db_hash=''
+  WEB_RESET_DB_HASH=''
+  rm -f -- "$db" "${db}-wal" "${db}-shm" "${db}-journal" "$cookie"
+  start_local_web_for_password_reset "$db" "$api_port" "$config_proto" "$config_port" "$log" || {
+    stop_web_bootstrap; return 1;
+  }
+  if ! local_web_login "$api_port" "$WEB_DEFAULT_ADMIN_LOGIN_HASH" "$cookie"; then
+    warn '无法登录临时数据库中的上游 admin 初始账户。'
+    stop_web_bootstrap; return 1
+  fi
+  new_login_hash=$(md5_hex "$password")
+  if ! printf '{"new_password":"%s"}' "$new_login_hash" | \
+    curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 8 \
+      -b "$cookie" -X PUT -H 'Content-Type: application/json' --data-binary @- \
+      "http://127.0.0.1:${api_port}/api/v1/auth/password" -o /dev/null; then
+    warn '临时 Web 管理员密码修改失败。'
+    stop_web_bootstrap; return 1
+  fi
+  if ! local_web_login "$api_port" "$new_login_hash" "$cookie"; then
+    warn '临时 Web 管理员的新密码验证失败。'
+    stop_web_bootstrap; return 1
+  fi
+  stop_web_bootstrap
+  sqlite_integrity_ok "$db" || return 1
+  count=$(sqlite3 -batch -bail -cmd '.timeout 5000' "$db" \
+    "SELECT COUNT(*) FROM users WHERE username='admin';" 2>/dev/null) || return 1
+  [[ $count == 1 ]] || return 1
+  db_hash=$(sqlite3 -batch -bail -cmd '.timeout 5000' "$db" \
+    "SELECT password FROM users WHERE username='admin';" 2>/dev/null) || return 1
+  valid_web_db_password_hash "$db_hash" || return 1
+  WEB_RESET_DB_HASH=$db_hash
+}
+
+replace_web_admin_db_hash() {
+  local db_hash=$1 count='' changed='' stored=''
+  valid_web_db_password_hash "$db_hash" || return 1
+  sqlite_integrity_ok "$WEB_DB_FILE" || return 1
+  count=$(sqlite3 -batch -bail -cmd '.timeout 5000' "$WEB_DB_FILE" \
+    "SELECT COUNT(*) FROM users WHERE username='admin';" 2>/dev/null) || return 1
+  [[ $count == 1 ]] || return 1
+  # 哈希先经严格 PHC 正则校验且不含单引号；SQL 走 stdin，避免哈希出现在 sqlite3 的进程参数中。
+  changed=$(printf "%s\n" \
+    "BEGIN IMMEDIATE; UPDATE users SET password='${db_hash}' WHERE username='admin'; SELECT changes(); COMMIT;" | \
+    sqlite3 -batch -bail -cmd '.timeout 5000' "$WEB_DB_FILE" 2>/dev/null) || return 1
+  [[ $changed == 1 ]] || return 1
+  stored=$(sqlite3 -batch -bail -cmd '.timeout 5000' "$WEB_DB_FILE" \
+    "SELECT password FROM users WHERE username='admin';" 2>/dev/null) || return 1
+  [[ $stored == "$db_hash" ]] && sqlite_integrity_ok "$WEB_DB_FILE"
+}
+
+verify_running_web_admin_password() {
+  local password=$1 cookie=$2 port=''
+  port=$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-port 2>/dev/null || true)
+  valid_port "$port" || return 1
+  local_web_login "$port" "$(md5_hex "$password")" "$cookie"
+}
+
 wait_web_healthy() {
   local web_port i stable=0
   [[ -r $WEB_ARGS_FILE ]] || return 1
@@ -1400,7 +1621,7 @@ do_install() {
   end_critical_section
   enable_updates
   show_web_access_info
-  printf '\n常用命令：\n  查看节点：easytier-cli peer\n  查看状态：sudo easytier-installer --status\n  查看日志：sudo easytier-installer --logs\n  再次配置：sudo easytier-installer --configure\n  手动更新：sudo easytier-installer --update\n'
+  printf '\n常用命令：\n  查看节点：easytier-cli peer\n  查看状态：sudo easytier-installer --status\n  查看日志：sudo easytier-installer --logs\n  再次配置：sudo easytier-installer --configure\n  重置 Web 密码：sudo easytier-installer --reset-web-password\n  手动更新：sudo easytier-installer --update\n'
 }
 
 do_configure() {
@@ -1426,6 +1647,86 @@ do_configure() {
   fi
   finish_binary_transaction
   end_critical_section
+  show_web_access_info
+}
+
+do_reset_web_password() {
+  local suggested='' config_proto='' config_family='' api_port='' config_port=''
+  local temp='' log='' cookie='' seed_db='' backup='' was_active=false
+  need_root; need_systemd; acquire_lock
+  validate_web_password_reset_paths
+  suggested=$(generate_default_secret)
+  while true; do
+    ask WEB_ADMIN_PASSWORD '请输入新的 Web 管理员密码（输入会明文显示，直接回车使用随机值）' "$suggested"
+    valid_web_password "$WEB_ADMIN_PASSWORD" && break
+    warn '密码需为 12～128 位，只能使用英文字母、数字和 -._~!@%+=:/。'
+  done
+  install_tools
+  install_sqlite_tool
+  config_proto=$(arg_value_from_file "$WEB_ARGS_FILE" --config-server-protocol 2>/dev/null || true)
+  [[ $config_proto =~ ^(udp|tcp|ws)$ ]] || die 'web.args 中的配置下发协议无效，拒绝重置密码。'
+  config_family=$(protocol_family "$config_proto") || die '无法判断 Web 配置下发协议。'
+  systemctl is-active --quiet easytier-web.service && was_active=true
+  temp=$(mktemp -d "${CONFIG_DIR}/.password-reset.XXXXXX") || die '无法创建密码重置临时目录。'
+  chmod 0700 "$temp"
+  log="${temp}/web.log"; cookie="${temp}/cookie"; seed_db="${temp}/seed.db"; backup="${temp}/web.db.backup"
+  PASSWORD_RESET_TEMP_DIR=$temp
+  PASSWORD_RESET_BACKUP_FILE=$backup
+  PASSWORD_RESET_WAS_ACTIVE=$was_active
+
+  begin_critical_section
+  if ! systemctl stop easytier-web.service; then
+    if ! restore_web_active_state_without_db_change "$was_active"; then
+      clear_web_password_reset_state; end_critical_section
+      die '停止 Web 控制面板失败；密码未修改，但无法恢复服务原来的运行状态。'
+    fi
+    clear_web_password_reset_state; end_critical_section
+    die '无法停止 Web 控制面板，未修改密码。'
+  fi
+  if systemctl is-active --quiet easytier-web.service; then
+    clear_web_password_reset_state; end_critical_section
+    die 'Web 控制面板仍在运行，未修改密码。'
+  fi
+  if ! backup_web_password_database "$backup"; then
+    if ! restore_web_active_state_without_db_change "$was_active"; then
+      clear_web_password_reset_state; end_critical_section
+      die '数据库尚未修改，但无法恢复 Web 控制面板原来的运行状态。'
+    fi
+    clear_web_password_reset_state; end_critical_section
+    die '无法创建并校验 Web 账户数据库备份，未修改密码。'
+  fi
+  PASSWORD_RESET_ACTIVE=true
+
+  api_port=$(next_free_port tcp 45111 2>/dev/null || true)
+  config_port=$(next_free_port "$config_family" 45220 2>/dev/null || true)
+  if [[ $config_family == tcp && -n $api_port && $config_port == "$api_port" ]]; then
+    config_port=$(next_free_port tcp "$((10#$config_port + 1))" 2>/dev/null || true)
+  fi
+  if ! valid_port "$api_port" || ! valid_port "$config_port"; then
+    abort_web_password_reset '无法找到临时 Web 实例所需的空闲端口'
+  fi
+  info '正在本机生成并验证新的 Web 管理员密码……'
+  generate_web_admin_db_hash "$WEB_ADMIN_PASSWORD" "$seed_db" "$api_port" "$config_proto" "$config_port" "$log" "$cookie" || \
+    abort_web_password_reset '新密码生成或验证失败'
+  replace_web_admin_db_hash "$WEB_RESET_DB_HASH" || abort_web_password_reset '写入新管理员密码失败'
+
+  if [[ $was_active == true ]]; then
+    systemctl reset-failed easytier-web.service >/dev/null 2>&1 || true
+    systemctl start easytier-web.service || abort_web_password_reset 'Web 控制面板无法使用新密码启动'
+    wait_web_healthy || abort_web_password_reset 'Web 控制面板未能通过启动健康检查'
+    verify_running_web_admin_password "$WEB_ADMIN_PASSWORD" "$cookie" || \
+      abort_web_password_reset '正式 Web 控制面板未接受新密码'
+  else
+    start_local_web_for_password_reset "$WEB_DB_FILE" "$api_port" "$config_proto" "$config_port" "$log" || \
+      abort_web_password_reset '无法用原账户数据库验证新密码'
+    local_web_login "$api_port" "$(md5_hex "$WEB_ADMIN_PASSWORD")" "$cookie" || \
+      abort_web_password_reset '原账户数据库未接受新密码'
+    stop_web_bootstrap
+  fi
+  clear_web_password_reset_state
+  end_critical_section
+  ok 'Web 管理员密码已安全重置；其他账户、设备和组网配置均已保留。'
+  [[ $was_active == true ]] || info 'Web 控制面板在重置前处于停止状态，密码已修改，但服务仍保持停止。'
   show_web_access_info
 }
 
@@ -1492,11 +1793,11 @@ do_uninstall() {
 
 menu() {
   printf '\n%s\n' '========== EasyTier 一键管理脚本 =========='
-  printf '%s\n' '1) 安装 / 重新安装并配置' '2) 更新到最新版' '3) 重新配置' '4) 查看状态' '5) 实时日志' '6) 卸载' '0) 退出'
-  local choice; read -r -p '请选择 [0-6]: ' choice
+  printf '%s\n' '1) 安装 / 重新安装并配置' '2) 更新到最新版' '3) 重新配置' '4) 查看状态' '5) 实时日志' '6) 卸载' '7) 重置 Web 管理员密码' '0) 退出'
+  local choice; read -r -p '请选择 [0-7]: ' choice
   case $choice in
     1) do_install;; 2) do_update;; 3) do_configure;; 4) show_status;;
-    5) show_logs;; 6) do_uninstall;; 0) exit 0;; *) die '无效选择。';;
+    5) show_logs;; 6) do_uninstall;; 7) do_reset_web_password;; 0) exit 0;; *) die '无效选择。';;
   esac
 }
 
@@ -1504,6 +1805,14 @@ cleanup_main() {
   local rc=$?
   set +e
   stop_web_bootstrap
+  if [[ $PASSWORD_RESET_ACTIVE == true ]]; then
+    warn '密码重置被意外中断，正在恢复原 Web 账户数据库。'
+    if restore_web_password_database; then
+      clear_web_password_reset_state
+    else
+      warn "自动恢复失败，请保留备份并人工处理：${PASSWORD_RESET_BACKUP_FILE}"
+    fi
+  fi
   [[ -z $WORK_TMP || ! -d $WORK_TMP ]] || rm -rf -- "$WORK_TMP"
   if ((rc != 0)) && [[ $BINARY_CHANGED == true ]]; then rollback_binary; fi
   return "$rc"
@@ -1522,8 +1831,8 @@ main() {
   validate_runtime_paths
   case ${1:-} in
     --install) do_install;; --update) do_update;; --configure) do_configure;; --uninstall) do_uninstall;;
-    --status) show_status;; --logs) show_logs;;
-    -h|--help) echo "用法：sudo bash $0 [--install|--update|--configure|--status|--logs|--uninstall]";;
+    --reset-web-password) do_reset_web_password;; --status) show_status;; --logs) show_logs;;
+    -h|--help) echo "用法：sudo bash $0 [--install|--update|--configure|--reset-web-password|--status|--logs|--uninstall]";;
     '') menu;; *) die "未知参数：$1（使用 --help 查看帮助）";;
   esac
 }
