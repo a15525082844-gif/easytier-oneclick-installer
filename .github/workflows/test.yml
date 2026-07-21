@@ -38,6 +38,70 @@ jobs:
             curl --disable --noproxy '*' -fsS "http://127.0.0.1:11211/" -o /dev/null && break
             sleep 0.1
           done
+          {
+            printf '\n%.0s' {1..4}
+            printf '%s\n' 'tcp,udp,ws,wss,wg,quic,faketcp'
+            printf '\n%.0s' {1..40}
+          } | sudo --preserve-env=EASYTIER_VERSION bash ./easytier-installer.sh --install
+          sudo grep -Fx '11212' /etc/easytier/web.args
+      - name: Verify Core and Web services
+        run: |
+          sudo systemctl is-active --quiet easytier.service
+          sudo systemctl is-active --quiet easytier-web.service
+          web_port=$(sudo awk 'previous == "--api-server-port" { print; exit } { previous=$0 }' /etc/easytier/web.args)
+          curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
+            "http://127.0.0.1:${web_port}/api/v1/auth/captcha" -o /dev/null
+      - name: Reconfigure an existing installation
+        run: sudo easytier-installer --configure </dev/null
+      - name: Verify services after reconfiguration
+        if: always()
+        run: |
+          sudo systemctl status easytier-web.service --no-pager -l || true
+          sudo journalctl -u easytier-web.service -n 100 --no-pager || true
+          sudo systemctl status easytier.service --no-pager -l || true
+          sudo journalctl -u easytier.service -n 100 --no-pager || true
+          sudo systemctl is-active --quiet easytier.service
+          sudo systemctl is-active --quiet easytier-web.service
+name: Test installer
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check documented bootstrap hash
+        run: grep -F "$(sha256sum easytier-installer.sh | awk '{print $1}')  easytier-installer.sh" README.md
+      - name: Bash syntax
+        run: bash -n easytier-installer.sh tests/test_installer.sh
+      - name: ShellCheck
+        run: shellcheck -x easytier-installer.sh tests/test_installer.sh
+      - name: Regression tests
+        run: bash tests/test_installer.sh
+
+  linux-integration:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and start the real EasyTier release
+        env:
+          EASYTIER_VERSION: v2.6.4
+        run: |
+          python3 -m http.server 11211 --bind 127.0.0.1 >/tmp/easytier-port-blocker.log 2>&1 &
+          blocker_pid=$!
+          trap 'kill "$blocker_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..20}; do
+            curl --disable --noproxy '*' -fsS "http://127.0.0.1:11211/" -o /dev/null && break
+            sleep 0.1
+          done
           sudo --preserve-env=EASYTIER_VERSION bash ./easytier-installer.sh --install </dev/null
           sudo grep -Fx '11212' /etc/easytier/web.args
       - name: Verify Core and Web services
