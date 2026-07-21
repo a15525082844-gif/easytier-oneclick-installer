@@ -51,6 +51,53 @@ jobs:
           web_port=$(sudo awk 'previous == "--api-server-port" { print; exit } { previous=$0 }' /etc/easytier/web.args)
           curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
             "http://127.0.0.1:${web_port}/api/v1/auth/captcha" -o /dev/null
+      - name: Reset Web password without losing other data
+        run: |
+          db_fingerprint() {
+            sudo python3 - <<'PY'
+          import hashlib
+          import sqlite3
+
+          db = sqlite3.connect('/etc/easytier/web.db')
+          snapshot = []
+          for sql in (
+              'SELECT id, username FROM users ORDER BY id',
+              "SELECT id, username, password FROM users WHERE username <> 'admin' ORDER BY id",
+              'SELECT * FROM groups ORDER BY id',
+              'SELECT * FROM permissions ORDER BY id',
+              'SELECT user_id, group_id FROM users_groups ORDER BY user_id, group_id',
+              'SELECT group_id, permission_id FROM groups_permissions ORDER BY group_id, permission_id',
+          ):
+              snapshot.append(db.execute(sql).fetchall())
+          config_columns = [
+              row[1] for row in db.execute('PRAGMA table_info(user_running_network_configs)')
+              if row[1] != 'update_time'
+          ]
+          quoted_columns = ', '.join(f'"{column}"' for column in config_columns)
+          snapshot.append(db.execute(
+              f'SELECT {quoted_columns} FROM user_running_network_configs ORDER BY id'
+          ).fetchall())
+          print(hashlib.sha256(repr(snapshot).encode()).hexdigest())
+          PY
+          }
+          before_non_auth=$(db_fingerprint)
+          printf '%s\n' 'Fixed_Web-Password:2026!' | sudo easytier-installer --reset-web-password
+          after_non_auth=$(db_fingerprint)
+          test "$before_non_auth" = "$after_non_auth"
+          sudo systemctl is-active --quiet easytier.service
+          sudo systemctl is-active --quiet easytier-web.service
+          web_port=$(sudo awk 'previous == "--api-server-port" { print; exit } { previous=$0 }' /etc/easytier/web.args)
+          new_hash=$(printf '%s' 'Fixed_Web-Password:2026!' | md5sum | awk '{print $1}')
+          new_status=$(printf '{"username":"admin","password":"%s"}' "$new_hash" | \
+            curl --disable --noproxy '*' -sS --connect-timeout 2 --max-time 8 \
+              -H 'Content-Type: application/json' --data-binary @- -o /dev/null -w '%{http_code}' \
+              "http://127.0.0.1:${web_port}/api/v1/auth/login")
+          default_status=$(printf '{"username":"admin","password":"%s"}' '21232f297a57a5a743894a0e4a801fc3' | \
+            curl --disable --noproxy '*' -sS --connect-timeout 2 --max-time 8 \
+              -H 'Content-Type: application/json' --data-binary @- -o /dev/null -w '%{http_code}' \
+              "http://127.0.0.1:${web_port}/api/v1/auth/login")
+          test "$new_status" = 200
+          test "$default_status" = 401
       - name: Reconfigure an existing installation
         run: sudo easytier-installer --configure </dev/null
       - name: Verify services after reconfiguration
@@ -62,3 +109,9 @@ jobs:
           sudo journalctl -u easytier.service -n 100 --no-pager || true
           sudo systemctl is-active --quiet easytier.service
           sudo systemctl is-active --quiet easytier-web.service
+          web_port=$(sudo awk 'previous == "--api-server-port" { print; exit } { previous=$0 }' /etc/easytier/web.args)
+          new_hash=$(printf '%s' 'Fixed_Web-Password:2026!' | md5sum | awk '{print $1}')
+          printf '{"username":"admin","password":"%s"}' "$new_hash" | \
+            curl --disable --noproxy '*' -fsS --connect-timeout 2 --max-time 8 \
+              -H 'Content-Type: application/json' --data-binary @- \
+              "http://127.0.0.1:${web_port}/api/v1/auth/login" -o /dev/null
