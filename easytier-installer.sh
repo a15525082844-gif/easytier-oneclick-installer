@@ -600,7 +600,7 @@ validate_config_candidate() {
 }
 
 configure() {
-  local network secret default_secret mode ipv4 hostname protocols peers external proxy_nets rpc_port socks5 compression extra answer
+  local access_choice access_mode network secret default_secret mode ipv4 hostname protocols peers external proxy_nets rpc_port socks5 compression extra answer
   local vpn_port vpn_cidr proto port family key default_port
   local web_access web_bind web_port web_config_proto web_config_port web_family web_default_password original_port candidate
   local -a proto_items=() normalized_protocols=()
@@ -608,7 +608,31 @@ configure() {
   WEB_ENABLED=false; WEB_ADMIN_PASSWORD=''; WEB_ARGS=()
   rm -f -- "${WEB_ARGS_FILE}.new"
   printf '\n%s\n' '========== EasyTier 小白配置向导 =========='
-  echo '同一网络里的设备：网络名称和网络密钥必须相同，固定虚拟 IP 不能重复。带 [默认值] 的项目直接回车即可。'
+  printf '%s\n' \
+    '请选择节点接入方式：' \
+    '  1) 私有网络（推荐）：只允许网络名称和网络密钥都相同的节点连接；其他网络不能通过本机中转' \
+    '  2) IP + 端口开放连接（公共共享 / 中继）：其他 EasyTier 网络知道本机 IP 和监听端口即可连接并使用本机中继'
+  while :; do
+    ask access_choice '请选择接入方式（1/2）' '1'
+    case $access_choice in
+      1) access_mode=private; break;;
+      2)
+        warn '已选择公共共享 / 中继模式：陌生网络不会自动加入你的私有网络，但可使用本机带宽进行握手和中转。请只在有意提供共享节点时启用。'
+        warn '该模式可能产生大量带宽、CPU、内存和连接数消耗，也可能被扫描或滥用。请配置防火墙并监控流量。'
+        if yesno '确认将本机作为公共共享 / 中继节点？' n; then
+          access_mode=shared
+        else
+          access_mode=private
+          info '已改用私有网络模式。'
+        fi
+        break;;
+      *) warn '请输入 1 或 2。';;
+    esac
+  done
+  echo '本机所在网络里的设备：网络名称和网络密钥必须相同，固定虚拟 IP 不能重复。带 [默认值] 的项目直接回车即可。'
+  if [[ $access_mode == shared ]]; then
+    info '下面的网络名称和密钥是本共享节点自己的身份；外部网络连接本机中继时不需要知道它们，但仍需使用外部网络自己的名称和密钥。'
+  fi
   ask network '网络名称（英文、数字、点、下划线、短横线）' 'my-easytier'
   while [[ ! $network =~ ^[A-Za-z0-9._-]{1,64}$ ]]; do warn '网络名称格式不正确。'; ask network '请重新输入网络名称' 'my-easytier'; done
   default_secret=$(generate_default_secret)
@@ -633,6 +657,11 @@ configure() {
   ((${#normalized_protocols[@]} > 0)) || die '至少选择一个监听协议。'
 
   CONFIG_ARGS=(--instance-name "$MANAGED_INSTANCE_NAME" "--network-name=${network}" "--network-secret=${secret}" "--hostname=${hostname}")
+  if [[ $access_mode == private ]]; then
+    CONFIG_ARGS+=(--private-mode true --relay-network-whitelist "$network" --relay-all-peer-rpc false)
+  else
+    CONFIG_ARGS+=(--private-mode false --relay-network-whitelist '*' --relay-all-peer-rpc false)
+  fi
   [[ $mode == dhcp ]] && CONFIG_ARGS+=(--dhcp) || CONFIG_ARGS+=(--ipv4 "$ipv4")
   echo '下面为每种协议设置端口；同类协议不能占用同一个端口。'
   for proto in "${normalized_protocols[@]}"; do
@@ -783,7 +812,8 @@ configure() {
       -n|-n?*|--proxy-networks|--proxy-networks=*|--listeners|--listeners=*|-l|-l?*|--no-listener|\
       --rpc-portal|--rpc-portal=*|-r|-r?*|--socks5|--socks5=*|--vpn-portal|--vpn-portal=*|\
       --config-server|--config-server=*|-w|-w?*|\
-      --compression|--compression=*|--multi-thread|--multi-thread=*|--latency-first|--latency-first=*|--disable-ipv6|--disable-ipv6=*)
+      --compression|--compression=*|--multi-thread|--multi-thread=*|--latency-first|--latency-first=*|--disable-ipv6|--disable-ipv6=*|\
+      --private-mode|--private-mode=*|--relay-network-whitelist|--relay-network-whitelist=*|--relay-all-peer-rpc|--relay-all-peer-rpc=*)
         warn '此参数已由向导管理，不能在高级参数中重复添加。'; continue;;
     esac
     CONFIG_ARGS+=("$extra")

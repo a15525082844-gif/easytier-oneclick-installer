@@ -134,6 +134,9 @@ hostname() { printf 'test-host\n'; }
 configure </dev/null
 assert_eq "$WEB_ENABLED" true
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --instance-name)" "$MANAGED_INSTANCE_NAME"
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --private-mode)" true
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --relay-network-whitelist)" 'my-easytier'
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --relay-all-peer-rpc)" false
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --config-server)" 'udp://127.0.0.1:22020/admin'
 assert_eq "$(arg_value_from_file "${WEB_ARGS_FILE}.new" --api-server-addr)" '127.0.0.1'
 assert_eq "$(arg_value_from_file "${WEB_ARGS_FILE}.new" --api-server-port)" '11211'
@@ -152,10 +155,22 @@ ss() {
     *' -lnu '*) printf 'UNCONN 0 0 127.0.0.1:22020 0.0.0.0:*\n';;
   esac
 }
-configure </dev/null
+configure <<< $'2\ny'
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --private-mode)" false
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --relay-network-whitelist)" '*'
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --relay-all-peer-rpc)" false
+grep -Fx -- '--network-name=my-easytier' "${ARGS_FILE}.new" >/dev/null || fail 'shared relay mode removed the local network name'
+grep -E '^--network-secret=et-[0-9a-fA-F]{20}$' "${ARGS_FILE}.new" >/dev/null || fail 'shared relay mode removed the local network secret'
+((pass+=2))
 assert_eq "$(arg_value_from_file "${WEB_ARGS_FILE}.new" --api-server-port)" '11212'
 assert_eq "$(arg_value_from_file "${WEB_ARGS_FILE}.new" --config-server-port)" '22021'
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --config-server)" 'udp://127.0.0.1:22021/admin'
+
+# 公开共享模式必须二次确认；拒绝确认时安全回退到默认私有模式。
+configure <<< $'2\nn'
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --private-mode)" true
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --relay-network-whitelist)" 'my-easytier'
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --relay-all-peer-rpc)" false
 unset -f ss
 rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new"
 
