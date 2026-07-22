@@ -7,13 +7,13 @@
 GitHub 官方线路（海外服务器或已配置代理时使用）：
 
 ```bash
-curl --disable -fsSL https://raw.githubusercontent.com/a15525082844-gif/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh && sudo bash easytier-installer.sh --install
+curl --disable -fsSL https://raw.githubusercontent.com/AiCodeNb/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh && sudo bash easytier-installer.sh --install
 ```
 
 中国大陆网络推荐使用国内优选 IPv4 加速线路：
 
 ```bash
-curl --disable -fL https://v4.gh-proxy.org/https://raw.githubusercontent.com/a15525082844-gif/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh
+curl --disable -fL https://v4.gh-proxy.org/https://raw.githubusercontent.com/AiCodeNb/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh
 echo 'c72940332e210b0dae48df1d5dd8ae86d7e810fd96f86800d9bf8170b7b531ac  easytier-installer.sh' | sha256sum -c -
 less easytier-installer.sh
 # 确认脚本内容后再执行：
