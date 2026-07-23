@@ -209,7 +209,7 @@ jobs:
             ! sudo grep -Fxq -- "$forbidden" /etc/easytier/config.args
           done
           instance_id=$(sudo cat /etc/easytier/managed-instance-id)
-          test -s "/etc/easytier/networks/${instance_id}.toml"
+          sudo test -s "/etc/easytier/networks/${instance_id}.toml"
           sudo systemctl is-active --quiet easytier.service
           sudo systemctl is-active --quiet easytier-web.service
       - name: Edit through Web API and verify persistence after restart
@@ -420,10 +420,10 @@ jobs:
           PY
 
           for attempt in {1..30}; do
-            test ! -e "/etc/easytier/networks/${INSTANCE_ID}.toml" && break
+            sudo test ! -e "/etc/easytier/networks/${INSTANCE_ID}.toml" && break
             sleep 1
           done
-          test ! -e "/etc/easytier/networks/${INSTANCE_ID}.toml"
+          sudo test ! -e "/etc/easytier/networks/${INSTANCE_ID}.toml"
           if sudo /opt/easytier/easytier-cli -p 127.0.0.1:15888 node >/tmp/empty-node.out 2>&1; then
             echo 'expected an empty Web-managed host' >&2
             exit 1
