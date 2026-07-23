@@ -14,7 +14,7 @@ curl --disable -fsSL https://raw.githubusercontent.com/AiCodeNb/easytier-oneclic
 
 ```bash
 curl --disable -fL https://v4.gh-proxy.org/https://raw.githubusercontent.com/AiCodeNb/easytier-oneclick-installer/main/easytier-installer.sh -o easytier-installer.sh
-echo 'c72940332e210b0dae48df1d5dd8ae86d7e810fd96f86800d9bf8170b7b531ac  easytier-installer.sh' | sha256sum -c -
+echo '8ea007d916682171b1b1141d4c3130657a839d2b3785389d04987557cb11cde5  easytier-installer.sh' | sha256sum -c -
 less easytier-installer.sh
 # 确认脚本内容后再执行：
 sudo bash easytier-installer.sh --install
@@ -42,9 +42,43 @@ EASYTIER_GITHUB_PROXY=https://你的代理地址 sudo -E bash easytier-installer
 
 默认候选包括 `v4.gh-proxy.org`、`cdn.gh-proxy.org`、`gh-proxy.com`、`ghfast.top` 和 GitHub 官方线路。线路速度会因地区、运营商和 CDN 缓存变化，所以脚本每次需要下载新版本时都会重新测速。
 
+## 两种主机参数管理模式
+
+向导首先会问“主机参数由谁管理”。这个选项只决定以后在哪里修改这台主机的组网参数，和后面的“私有网络 / IP + 端口开放连接”不是一回事：前者决定**怎么管理**，后者决定**谁可以连接**。
+
+### 1）安装器管理（默认，适合新手）
+
+- 全新安装时直接回车就会选择此模式。
+- 网络名称、密钥、虚拟 IP、监听端口、连接节点等参数都由终端向导管理。
+- Web 面板仍可查看这台主机和运行状态，但为避免网页配置与启动参数互相覆盖，主机参数会显示为只读。
+- 需要修改时运行 `sudo easytier-installer --configure`，继续选择“安装器管理”，再按提示填写。
+
+### 2）Web 完全管理
+
+- 安装器会强制启用 Web 控制面板，并把主网络保存为 Web 可以读写的配置。
+- 以后可在 Web 的“远程管理”中修改网络名称、密钥、虚拟 IP、监听器、连接节点等参数，也可以启动、停用或删除网络。
+- 在 Web 中保存的修改会写入磁盘；重启 EasyTier、重启服务器或自动更新主程序后仍会保留。
+- 已处于此模式时再次运行 `--configure`，安装器会保留面板中的全部网络参数和网络文件，只重新询问本机 RPC、Web 访问范围和相关端口。
+- 此模式要求当前架构的 EasyTier Release 包含 `easytier-web-embed`；不带 Web 组件的架构不能选择。
+
+### 如何切换
+
+运行下面的命令，在向导开头选择另一种管理模式：
+
+```bash
+sudo easytier-installer --configure
+```
+
+- 从“安装器管理”切到“Web 完全管理”时，如果原 Core 正常运行，安装器会导出当前完整网络配置并保留主机身份与网络实例身份；没有可导出的运行实例时，则由向导创建一个可继续在 Web 中修改的初始网络。
+- 从“Web 完全管理”切回“安装器管理”时，需要在终端向导中重新确认组网参数；切换成功后，以这次向导填写的参数为准，Web 中原来的参数不再控制当前运行的主网络。
+- 切换时会先停止相关服务并备份当前配置、网络文件和 Web 数据库。只有新配置通过检查并成功启动才会生效；失败会自动恢复旧模式和旧配置。
+
+管理方式变更属于重要操作。虽然脚本带自动回滚，长期运行或保存了多个 Web 网络时，仍建议先自行备份整个 `/etc/easytier` 目录。不要在 Web 完全管理模式下额外加入会覆盖网络的 Core 命令行参数，否则该网络会重新变成只读。
+
 ## 向导怎么填写
 
 - 提示中带 `[默认值]` 的项目，不输入内容直接回车就会采用该值；可选项目直接回车表示不启用。
+- 主机参数管理模式：全新安装默认选择“安装器管理”；以后重新运行向导时，直接回车会沿用当前管理模式。
 - 节点接入方式有两个选项：
   - `1) 私有网络（推荐，默认）`：只有网络名称和网络密钥都相同的设备才能连接本节点，其他虚拟网络不能借用本节点中转。
   - `2) IP + 端口开放连接（公共共享 / 中继）`：其他 EasyTier 网络知道本机 IP 和监听端口后，就能连接本机并用于发现和中继。它们不需要知道本共享节点自己的网络名称和密钥，仍使用各自网络的名称和密钥，也不能借此加入你的私有网络；该模式会消耗本机带宽和连接资源，因此脚本会要求再次确认。
@@ -88,6 +122,8 @@ sudo easytier-installer --reset-web-password
 
 终端会明文显示输入内容；不输入直接回车会采用当场生成的随机强密码。重置过程只修改 `admin` 的密码，不改 Core 组网参数，也会保留其他 Web 账户、设备和配置：脚本先停止 Web 并创建经过完整性检查的数据库备份，再让当前安装的 EasyTier Web 在临时数据库中生成兼容的密码哈希，写入后用新密码实际登录验证。任何一步失败都会恢复原数据库和原服务状态。Web 原本处于停止状态时，重置后仍保持停止。
 
+如果 Web 的“远程管理”中主机参数是只读，这通常表示当前选择的是“安装器管理”，不是面板故障。可先运行 `sudo easytier-installer --status` 查看当前模式；确实需要在网页中修改时，再用 `sudo easytier-installer --configure` 切换到“Web 完全管理”。
+
 旧版脚本已经安装过 EasyTier、但缺少 Web 组件时，下载本仓库最新版脚本并执行：
 
 ```bash
@@ -119,7 +155,7 @@ sudo easytier-installer --reset-web-password
 sudo easytier-installer --uninstall
 ```
 
-组网配置保存在 `/etc/easytier/config.args`，Web 启动参数保存在 `/etc/easytier/web.args`，权限均为 `0600`；程序位于 `/opt/easytier`。重新配置会真正重启 Core 和 Web 服务，新配置启动失败时自动恢复旧配置。
+当前管理模式记录在 `/etc/easytier/management.mode`，Web 启动参数保存在 `/etc/easytier/web.args`。在“安装器管理”模式下，组网参数保存在 `/etc/easytier/config.args`；在“Web 完全管理”模式下，该文件只保存 Core 的本机启动参数，可编辑的网络配置保存在 `/etc/easytier/networks/<网络实例 UUID>.toml`。主机身份与安装器主网络身份分别保存在 `/etc/easytier/machine-id` 和 `/etc/easytier/managed-instance-id`，切换与更新时会保持稳定，避免 Web 把同一台主机误认成新设备。配置文件权限为 `0600`，网络配置目录权限为 `0700`；程序位于 `/opt/easytier`。重新配置会真正重启 Core 和 Web 服务，新配置启动失败时自动恢复旧配置。
 
 ## 自动更新与回滚
 
@@ -155,7 +191,7 @@ Windows、macOS、OpenWrt 请使用 EasyTier 官方对应安装包或插件。
 - 下载镜像只负责传输文件，永远不能提供自己文件的可信摘要；摘要只取自 GitHub 官方站或用户显式提供。
 - 测速会向候选镜像发送公开 EasyTier Release 的小块请求；不会向镜像发送网络密钥、GitHub Token 或私有仓库地址。
 - 配置向导会明文显示网络密钥，方便新手确认和复制；在他人可看到屏幕或终端记录的环境中，请自行输入新的强密钥。
-- 网络密钥不写入 systemd unit，但 EasyTier 以命令行参数启动；root 用户仍可从进程信息读取它。
+- “安装器管理”模式不会把网络密钥写入 systemd unit，但 EasyTier 会以命令行参数启动，root 用户仍可从配置和进程信息读取它；“Web 完全管理”模式把密钥保存在仅 root 可读的网络配置文件中，能登录 Web 的管理用户也可能查看或修改它。
 - 公共共享节点能够中继流量，应只选择可信节点并使用足够强的网络密钥。
 - 本机默认使用私有网络模式。只有明确要运营公共共享节点时才选择第二项；该模式可能被扫描、滥用中继或消耗大量流量、CPU、内存和连接数，请配置防火墙并监控带宽。
 - RPC 只监听 `127.0.0.1`。公开 SOCKS5、WireGuard 或子网代理会扩大可访问范围，不需要时不要开启。

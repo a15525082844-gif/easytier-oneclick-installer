@@ -22,6 +22,11 @@ readonly INSTALL_DIR BIN_DIR CONFIG_DIR SYSTEMD_DIR SELF_PATH RUNNER_PATH WEB_RU
 readonly ARGS_FILE="${CONFIG_DIR}/config.args"
 readonly WEB_ARGS_FILE="${CONFIG_DIR}/web.args"
 readonly WEB_DB_FILE="${CONFIG_DIR}/web.db"
+readonly MANAGEMENT_MODE_FILE="${CONFIG_DIR}/management.mode"
+readonly MACHINE_ID_FILE="${CONFIG_DIR}/machine-id"
+readonly MANAGED_INSTANCE_ID_FILE="${CONFIG_DIR}/managed-instance-id"
+readonly NETWORK_CONFIG_DIR="${CONFIG_DIR}/networks"
+readonly NETWORK_CONFIG_CANDIDATE="${CONFIG_DIR}/managed-network.toml.new"
 readonly VERSION_FILE="${INSTALL_DIR}/VERSION"
 readonly INSTALLER_ENV_FILE="${CONFIG_DIR}/installer.env"
 readonly SERVICE_FILE="${SYSTEMD_DIR}/easytier.service"
@@ -48,6 +53,8 @@ PASSWORD_RESET_BACKUP_FILE=''
 PASSWORD_RESET_TEMP_DIR=''
 PASSWORD_RESET_WAS_ACTIVE=false
 ERROR_MESSAGE_SHOWN=false
+MANAGEMENT_MODE=installer
+REQUIRE_MANAGED_INSTANCE=false
 
 umask 077
 
@@ -485,6 +492,285 @@ generate_default_secret() {
   printf 'et-%s\n' "${random_value:0:20}"
 }
 
+valid_uuid() {
+  [[ $1 =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+generate_uuid() {
+  local value='' digest=''
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    IFS= read -r value < /proc/sys/kernel/random/uuid || value=''
+  fi
+  if valid_uuid "$value"; then printf '%s\n' "${value,,}"; return 0; fi
+  digest=$(printf '%s' "${RANDOM}-${RANDOM}-${RANDOM}-${PPID}-$(date +%s%N)" | sha256sum | awk '{print tolower($1)}')
+  printf '%s-%s-4%s-a%s-%s\n' "${digest:0:8}" "${digest:8:4}" "${digest:13:3}" "${digest:17:3}" "${digest:20:12}"
+}
+
+current_management_mode() {
+  local saved=''
+  if [[ -r $MANAGEMENT_MODE_FILE ]]; then
+    IFS= read -r saved < "$MANAGEMENT_MODE_FILE" || saved=''
+    case $saved in installer|web) printf '%s\n' "$saved"; return 0;; esac
+  fi
+  if [[ -r $ARGS_FILE ]] && arg_value_from_file "$ARGS_FILE" --config-dir >/dev/null 2>&1; then
+    printf 'web\n'
+  else
+    printf 'installer\n'
+  fi
+}
+
+ensure_private_directory() {
+  local directory=$1
+  [[ ! -L $directory ]] || return 1
+  if [[ ${EASYTIER_INSTALLER_TEST_MODE:-0} == 1 ]]; then
+    mkdir -p -- "$directory"
+  else
+    install -d -o root -g root -m 0700 "$directory"
+  fi
+}
+
+read_uuid_file() {
+  local file=$1 value=''; local -a lines=()
+  [[ -f $file && ! -L $file ]] || return 1
+  mapfile -t lines < "$file" || return 1
+  ((${#lines[@]} == 1)) || return 1
+  value=${lines[0]}
+  value=${value,,}
+  valid_uuid "$value" || return 1
+  printf '%s\n' "$value"
+}
+
+valid_machine_id_seed() {
+  ((${#1} >= 1 && ${#1} <= 512)) &&
+    ! LC_ALL=C grep -q '[[:cntrl:]]' <<< "$1"
+}
+
+read_machine_id_file() {
+  local file=$1 value=''; local -a lines=()
+  [[ -f $file && ! -L $file ]] || return 1
+  mapfile -t lines < "$file" || return 1
+  ((${#lines[@]} == 1)) || return 1
+  value=${lines[0]}
+  valid_machine_id_seed "$value" || return 1
+  printf '%s\n' "$value"
+}
+
+ensure_stable_machine_id() {
+  local value='' explicit='' pid='' xdg='' process_home='' item candidate unique=''
+  local -a paths=() values=()
+  if [[ -e $MACHINE_ID_FILE || -L $MACHINE_ID_FILE ]]; then
+    [[ -f $MACHINE_ID_FILE && ! -L $MACHINE_ID_FILE ]] || die "machine-id 不能是符号链接或非普通文件：${MACHINE_ID_FILE}"
+    value=$(read_machine_id_file "$MACHINE_ID_FILE" 2>/dev/null || true)
+    [[ -n $value ]] || die "machine-id 内容无效：${MACHINE_ID_FILE}"
+    chmod 0600 "$MACHINE_ID_FILE"
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  if explicit=$(arg_value_from_file "$ARGS_FILE" --machine-id 2>/dev/null); then
+    valid_machine_id_seed "$explicit" || die '旧 Core 参数中的 machine-id 无效，拒绝静默更换设备身份。'
+    # 上游明确指定的 machine-id 优先于状态文件；非 UUID 值会由 EasyTier
+    # 确定性哈希为 UUID，因此必须原样保留，不能改成一个新随机 UUID。
+    if valid_uuid "$explicit"; then unique=${explicit,,}; else unique=$explicit; fi
+  else
+    if command -v systemctl >/dev/null 2>&1; then
+      pid=$(systemctl show easytier.service -p MainPID --value 2>/dev/null || true)
+    fi
+    if [[ $pid =~ ^[1-9][0-9]*$ && -r /proc/${pid}/environ ]]; then
+      while IFS='=' read -r item candidate; do
+        case $item in XDG_DATA_HOME) xdg=$candidate;; HOME) process_home=$candidate;; esac
+      done < <(tr '\0' '\n' < "/proc/${pid}/environ")
+    fi
+    [[ $xdg == /* && $xdg != *$'\n'* ]] && paths+=("${xdg%/}/easytier/machine_id")
+    [[ $process_home == /* && $process_home != *$'\n'* ]] && paths+=("${process_home%/}/.local/share/easytier/machine_id")
+    paths+=("/var/lib/easytier/machine_id" "/root/.local/share/easytier/machine_id" "${INSTALL_DIR}/et_machine_id")
+
+    for item in "${paths[@]}"; do
+      [[ -e $item || -L $item ]] || continue
+      [[ -f $item && ! -L $item ]] || die "发现不安全的上游 machine-id 文件：${item}"
+      candidate=$(read_uuid_file "$item" 2>/dev/null || true)
+      [[ -n $candidate ]] || die "上游 machine-id 文件内容无效：${item}"
+      values+=("$candidate")
+    done
+    for candidate in "${values[@]}"; do
+      if [[ -z $unique ]]; then unique=$candidate
+      elif [[ $candidate != "$unique" ]]; then
+        die '发现多个不一致的 EasyTier machine-id，无法安全判断当前 Web 主机身份。请先保留 /var/lib/easytier 与 /root/.local/share/easytier 后人工核对。'
+      fi
+    done
+  fi
+  [[ -n $unique ]] || unique=$(generate_uuid)
+
+  [[ ! -L $CONFIG_DIR ]] || die "配置目录不能是符号链接：${CONFIG_DIR}"
+  ensure_private_directory "$CONFIG_DIR" || die "无法创建安全配置目录：${CONFIG_DIR}"
+  printf '%s\n' "$unique" > "${MACHINE_ID_FILE}.new"
+  chmod 0600 "${MACHINE_ID_FILE}.new"
+  mv -f -- "${MACHINE_ID_FILE}.new" "$MACHINE_ID_FILE"
+  printf '%s\n' "$unique"
+}
+
+toml_escape() {
+  local value=$1
+  if LC_ALL=C printf '%s' "$value" | grep -q '[[:cntrl:]]'; then return 1; fi
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '%s' "$value"
+}
+
+managed_instance_id() {
+  local value=''
+  if [[ -e $MANAGED_INSTANCE_ID_FILE || -L $MANAGED_INSTANCE_ID_FILE ]]; then
+    [[ -f $MANAGED_INSTANCE_ID_FILE && ! -L $MANAGED_INSTANCE_ID_FILE ]] || die "managed-instance-id 不能是符号链接或非普通文件：${MANAGED_INSTANCE_ID_FILE}"
+    value=$(read_uuid_file "$MANAGED_INSTANCE_ID_FILE" 2>/dev/null || true)
+    [[ -n $value ]] || die "managed-instance-id 内容不是有效 UUID：${MANAGED_INSTANCE_ID_FILE}"
+  else
+    value=$(generate_uuid)
+  fi
+  printf '%s\n' "$value"
+}
+
+rewrite_toml_instance_id() {
+  local file=$1 instance_id=$2 count=''
+  local temp="${file}.rewrite"
+  count=$(awk '/^[[:space:]]*instance_id[[:space:]]*=/ { count++ } END { print count + 0 }' "$file") || return 1
+  [[ $count == 1 ]] || return 1
+  awk -v id="$instance_id" '
+    /^[[:space:]]*instance_id[[:space:]]*=/ { print "instance_id = \"" id "\""; next }
+    { print }
+  ' "$file" > "$temp" || { rm -f -- "$temp"; return 1; }
+  chmod 0600 "$temp"
+  mv -f -- "$temp" "$file"
+}
+
+export_running_network_candidate() {
+  local rpc=$1 exported_id='' instance_id=''
+  [[ -x ${INSTALL_DIR}/easytier-cli ]] || die '缺少 easytier-cli，无法安全迁移现有网络到 Web 管理模式。'
+  if ! "${INSTALL_DIR}/easytier-cli" -p "$rpc" -n "$MANAGED_INSTANCE_NAME" node config > "$NETWORK_CONFIG_CANDIDATE"; then
+    rm -f -- "$NETWORK_CONFIG_CANDIDATE"
+    die '无法从正在运行的安装器管理实例导出配置；旧配置未改动。请确认 easytier.service 正常后重试。'
+  fi
+  chmod 0600 "$NETWORK_CONFIG_CANDIDATE"
+  exported_id=$(awk -F '"' '/^[[:space:]]*instance_id[[:space:]]*=/ { print $2; exit }' "$NETWORK_CONFIG_CANDIDATE")
+  valid_uuid "$exported_id" || { rm -f -- "$NETWORK_CONFIG_CANDIDATE"; die 'EasyTier 导出的配置缺少有效 instance_id，拒绝迁移。'; }
+  instance_id=$(managed_instance_id)
+  if [[ -e $MANAGED_INSTANCE_ID_FILE || -L $MANAGED_INSTANCE_ID_FILE ]]; then
+    rewrite_toml_instance_id "$NETWORK_CONFIG_CANDIDATE" "$instance_id" || die '无法在迁移配置中保留原 instance-id。'
+  else
+    instance_id=${exported_id,,}
+  fi
+  printf '%s\n' "$instance_id" > "${MANAGED_INSTANCE_ID_FILE}.new"
+  chmod 0600 "${MANAGED_INSTANCE_ID_FILE}.new"
+  REQUIRE_MANAGED_INSTANCE=true
+}
+
+render_network_toml_from_args() {
+  local target=$1 instance_id=$2 i arg value
+  local instance_name=$MANAGED_INSTANCE_NAME network='' secret='' hostname='' ipv4='' dhcp=false
+  local socks5='' vpn='' compression=none private_mode=false relay_whitelist='*' relay_rpc=false
+  local multi_thread=true latency_first=false enable_ipv6=true escaped='' vpn_body='' vpn_listen='' vpn_cidr=''
+  local -a listeners=() peers=() proxy_networks=()
+  for ((i=0; i<${#CONFIG_ARGS[@]}; i++)); do
+    arg=${CONFIG_ARGS[$i]}
+    case $arg in
+      --instance-name) ((i+=1)); instance_name=${CONFIG_ARGS[$i]:-};;
+      --instance-name=*) instance_name=${arg#*=};;
+      --network-name=*) network=${arg#*=};;
+      --network-name) ((i+=1)); network=${CONFIG_ARGS[$i]:-};;
+      --network-secret=*) secret=${arg#*=};;
+      --network-secret) ((i+=1)); secret=${CONFIG_ARGS[$i]:-};;
+      --hostname=*) hostname=${arg#*=};;
+      --hostname) ((i+=1)); hostname=${CONFIG_ARGS[$i]:-};;
+      --dhcp) dhcp=true;;
+      --ipv4) ((i+=1)); ipv4=${CONFIG_ARGS[$i]:-};;
+      --listeners) ((i+=1)); listeners+=("${CONFIG_ARGS[$i]:-}");;
+      --peers|--external-node) ((i+=1)); peers+=("${CONFIG_ARGS[$i]:-}");;
+      --proxy-networks) ((i+=1)); proxy_networks+=("${CONFIG_ARGS[$i]:-}");;
+      --socks5) ((i+=1)); socks5=${CONFIG_ARGS[$i]:-};;
+      --vpn-portal) ((i+=1)); vpn=${CONFIG_ARGS[$i]:-};;
+      --compression) ((i+=1)); compression=${CONFIG_ARGS[$i]:-};;
+      --private-mode) ((i+=1)); private_mode=${CONFIG_ARGS[$i]:-};;
+      --relay-network-whitelist) ((i+=1)); relay_whitelist=${CONFIG_ARGS[$i]:-};;
+      --relay-all-peer-rpc) ((i+=1)); relay_rpc=${CONFIG_ARGS[$i]:-};;
+      --multi-thread)
+        if ((i+1 < ${#CONFIG_ARGS[@]})) && [[ ${CONFIG_ARGS[$((i+1))]} == true || ${CONFIG_ARGS[$((i+1))]} == false ]]; then
+          ((i+=1)); multi_thread=${CONFIG_ARGS[$i]}
+        else
+          multi_thread=true
+        fi;;
+      --latency-first) latency_first=true;;
+      --disable-ipv6) enable_ipv6=false;;
+    esac
+  done
+  valid_uuid "$instance_id" && [[ -n $network && -n $secret && -n $hostname && ${#listeners[@]} -gt 0 ]] || return 1
+  [[ $private_mode == true || $private_mode == false ]] || return 1
+  [[ $relay_rpc == true || $relay_rpc == false ]] || return 1
+  [[ $compression == none || $compression == zstd ]] || return 1
+  for value in "$instance_name" "$network" "$secret" "$hostname" "$ipv4" "$socks5" "$vpn" "$relay_whitelist" "${listeners[@]}" "${peers[@]}" "${proxy_networks[@]}"; do
+    toml_escape "$value" >/dev/null || return 1
+  done
+
+  {
+    escaped=$(toml_escape "$instance_name"); printf 'instance_name = "%s"\n' "$escaped"
+    printf 'instance_id = "%s"\n' "$instance_id"
+    escaped=$(toml_escape "$hostname"); printf 'hostname = "%s"\n' "$escaped"
+    printf 'dhcp = %s\n' "$dhcp"
+    if [[ $dhcp != true ]]; then escaped=$(toml_escape "$ipv4"); printf 'ipv4 = "%s"\n' "$escaped"; fi
+    printf 'listeners = [\n'
+    for value in "${listeners[@]}"; do escaped=$(toml_escape "$value"); printf '  "%s",\n' "$escaped"; done
+    printf ']\n'
+    if [[ -n $socks5 ]]; then printf 'socks5_proxy = "socks5://0.0.0.0:%s"\n' "$socks5"; fi
+    printf '\n[network_identity]\n'
+    escaped=$(toml_escape "$network"); printf 'network_name = "%s"\n' "$escaped"
+    escaped=$(toml_escape "$secret"); printf 'network_secret = "%s"\n' "$escaped"
+    if [[ -n $vpn ]]; then
+      vpn_body=${vpn#wg://}; vpn_listen=${vpn_body%%/*}; vpn_cidr=${vpn_body#*/}
+      printf '\n[vpn_portal_config]\n'
+      escaped=$(toml_escape "$vpn_cidr"); printf 'client_cidr = "%s"\n' "$escaped"
+      escaped=$(toml_escape "$vpn_listen"); printf 'wireguard_listen = "%s"\n' "$escaped"
+    fi
+    for value in "${peers[@]}"; do
+      printf '\n[[peer]]\n'; escaped=$(toml_escape "$value"); printf 'uri = "%s"\n' "$escaped"
+    done
+    for value in "${proxy_networks[@]}"; do
+      printf '\n[[proxy_network]]\n'
+      if [[ $value == *'->'* ]]; then
+        escaped=$(toml_escape "${value%%->*}"); printf 'cidr = "%s"\n' "$escaped"
+        escaped=$(toml_escape "${value#*->}"); printf 'mapped_cidr = "%s"\n' "$escaped"
+      else
+        escaped=$(toml_escape "$value"); printf 'cidr = "%s"\n' "$escaped"
+      fi
+    done
+    printf '\n[flags]\n'
+    printf 'private_mode = %s\n' "$private_mode"
+    escaped=$(toml_escape "$relay_whitelist"); printf 'relay_network_whitelist = "%s"\n' "$escaped"
+    printf 'relay_all_peer_rpc = %s\n' "$relay_rpc"
+    [[ $compression == zstd ]] && printf 'data_compress_algo = 2\n' || printf 'data_compress_algo = 1\n'
+    printf 'multi_thread = %s\n' "$multi_thread"
+    printf 'latency_first = %s\n' "$latency_first"
+    printf 'enable_ipv6 = %s\n' "$enable_ipv6"
+  } > "$target"
+  chmod 0600 "$target"
+}
+
+prepare_network_config_dir() {
+  local file owner=''
+  [[ ! -L $NETWORK_CONFIG_DIR ]] || die "网络配置目录不能是符号链接：${NETWORK_CONFIG_DIR}"
+  ensure_private_directory "$NETWORK_CONFIG_DIR" || die "无法创建安全网络配置目录：${NETWORK_CONFIG_DIR}"
+  if [[ ${EASYTIER_INSTALLER_TEST_MODE:-0} != 1 ]]; then
+    owner=$(stat -c '%u' "$NETWORK_CONFIG_DIR") || die '无法检查网络配置目录所有者。'
+    [[ $owner == 0 ]] || die "网络配置目录必须属于 root：${NETWORK_CONFIG_DIR}"
+  fi
+  for file in "$NETWORK_CONFIG_DIR"/*.toml; do
+    [[ -e $file || -L $file ]] || continue
+    [[ -f $file && ! -L $file ]] || die "网络配置不能是符号链接或非普通文件：${file}"
+    if [[ ${EASYTIER_INSTALLER_TEST_MODE:-0} != 1 ]]; then
+      owner=$(stat -c '%u' "$file") || die "无法检查网络配置所有者：${file}"
+      [[ $owner == 0 ]] || die "网络配置必须属于 root：${file}"
+    fi
+    chmod 0600 "$file"
+  done
+}
+
 valid_web_password() {
   ((${#1} >= 12 && ${#1} <= 128)) && [[ $1 =~ ^[-A-Za-z0-9._~!@%+=:/]+$ ]]
 }
@@ -501,6 +787,9 @@ arg_value_from_file() {
     if [[ ${args[$i]} == "$wanted" ]]; then
       ((i+1 < ${#args[@]})) || return 1
       printf '%s\n' "${args[$((i+1))]}"
+      return 0
+    elif [[ ${args[$i]} == "${wanted}="* ]]; then
+      printf '%s\n' "${args[$i]#*=}"
       return 0
     fi
   done
@@ -588,7 +877,7 @@ append_csv_args() {
 }
 
 validate_config_candidate() {
-  local core=${1:-${INSTALL_DIR}/easytier-core} output='' rc=0; local -a args
+  local core=${1:-${INSTALL_DIR}/easytier-core} output='' rc=0 mode='' file='' value='' marker=''; local -a args
   mapfile -t args < "${ARGS_FILE}.new" || return 1
   # v2.6.4 的 --check-config 只检查 TOML；使用 /dev/null 时合法 CLI 也返回 1。
   # 这里仅用 Clap 的退出码 2 拦截未知/缺值参数，真实语义由启动健康检查兜底。
@@ -597,146 +886,254 @@ validate_config_candidate() {
     warn "EasyTier 拒绝了参数（退出码 ${rc}）：${output:-无详细信息}"
     return 1
   fi
+  if [[ -r ${MANAGEMENT_MODE_FILE}.new ]]; then
+    IFS= read -r mode < "${MANAGEMENT_MODE_FILE}.new" || return 1
+  elif arg_value_from_file "${ARGS_FILE}.new" --config-dir >/dev/null 2>&1; then
+    mode=web
+  else
+    mode=installer
+  fi
+  if [[ $mode == installer ]]; then
+    [[ ! -e $NETWORK_CONFIG_CANDIDATE && ! -e ${MANAGED_INSTANCE_ID_FILE}.new ]] || return 1
+    return 0
+  fi
+  [[ $mode == web ]] || return 1
+  grep -Fxq -- '--daemon' "${ARGS_FILE}.new" || { warn 'Web 管理 Core 参数缺少 --daemon。'; return 1; }
+  value=$(arg_value_from_file "${ARGS_FILE}.new" --config-dir 2>/dev/null || true)
+  [[ $value == "$NETWORK_CONFIG_DIR" ]] || { warn 'Web 管理 Core 参数的 config-dir 不正确。'; return 1; }
+  value=$(arg_value_from_file "${ARGS_FILE}.new" --machine-id 2>/dev/null || true)
+  valid_machine_id_seed "$value" || { warn 'Web 管理 Core 参数缺少固定 machine-id。'; return 1; }
+  value=$(arg_value_from_file "${ARGS_FILE}.new" --config-server 2>/dev/null || true)
+  [[ $value =~ ^(udp|tcp|ws)://127\.0\.0\.1:[1-9][0-9]*/admin$ ]] || { warn 'Web 管理 Core 参数缺少本机配置服务器。'; return 1; }
+  for value in "${args[@]}"; do
+    case $value in
+      --instance-name|--instance-name=*|--network-name|--network-name=*|--network-secret|--network-secret=*|--hostname|--hostname=*|\
+      --dhcp|--dhcp=*|--ipv4|--ipv4=*|--ipv6|--ipv6=*|--peers|--peers=*|--external-node|--external-node=*|\
+      --proxy-networks|--proxy-networks=*|--listeners|--listeners=*|--mapped-listeners|--mapped-listeners=*|--no-listener|\
+      --socks5|--socks5=*|--vpn-portal|--vpn-portal=*|--compression|--compression=*|--multi-thread|--multi-thread=*|\
+      --latency-first|--latency-first=*|--disable-ipv6|--disable-ipv6=*|--private-mode|--private-mode=*|\
+      --relay-network-whitelist|--relay-network-whitelist=*|--relay-all-peer-rpc|--relay-all-peer-rpc=*)
+        warn "Web 管理 Core 命令行仍含网络参数：${value}"
+        return 1;;
+    esac
+  done
+  [[ ! -L $NETWORK_CONFIG_DIR ]] || { warn '网络配置目录不能是符号链接。'; return 1; }
+  for file in "$NETWORK_CONFIG_DIR"/*.toml; do
+    [[ -e $file || -L $file ]] || continue
+    [[ -f $file && ! -L $file ]] || { warn "网络配置不是安全的普通文件：${file}"; return 1; }
+    if ! output=$("$core" --disable-env-parsing --config-file "$file" --check-config 2>&1); then
+      warn "现有 Web 网络配置检查失败：${file}：${output:-无详细信息}"
+      return 1
+    fi
+  done
+  if [[ -e $NETWORK_CONFIG_CANDIDATE ]]; then
+    [[ -f $NETWORK_CONFIG_CANDIDATE && ! -L $NETWORK_CONFIG_CANDIDATE ]] || return 1
+    marker=$(read_uuid_file "${MANAGED_INSTANCE_ID_FILE}.new" 2>/dev/null || true)
+    [[ -n $marker ]] || { warn '待迁移网络缺少固定 instance-id。'; return 1; }
+    value=$(awk -F '"' '/^[[:space:]]*instance_id[[:space:]]*=/ { print $2; exit }' "$NETWORK_CONFIG_CANDIDATE")
+    [[ ${value,,} == "$marker" ]] || { warn 'TOML instance_id 与目标文件名不一致。'; return 1; }
+    if ! output=$("$core" --disable-env-parsing --config-file "$NETWORK_CONFIG_CANDIDATE" --check-config 2>&1); then
+      warn "待迁移 Web 网络配置检查失败：${output:-无详细信息}"
+      return 1
+    fi
+  fi
 }
 
 configure() {
-  local access_choice access_mode network secret default_secret mode ipv4 hostname protocols peers external proxy_nets rpc_port socks5 compression extra answer
-  local vpn_port vpn_cidr proto port family key default_port
+  local management_choice management_default current_mode configure_network=true migrate_running=false core_active=false
+  local access_choice access_mode network secret default_secret mode ipv4 hostname protocols peers external proxy_nets rpc_port socks5 compression extra
+  local vpn_port vpn_cidr proto port family key default_port rpc_default old_rpc_address='' machine_id instance_id
   local web_access web_bind web_port web_config_proto web_config_port web_family web_default_password original_port candidate
+  local web_access_default=1 web_port_default=11211 web_config_proto_default=udp web_config_port_default=22020 old_web_bind=''
   local -a proto_items=() normalized_protocols=()
   local -A used=() seen=()
-  WEB_ENABLED=false; WEB_ADMIN_PASSWORD=''; WEB_ARGS=()
-  rm -f -- "${WEB_ARGS_FILE}.new"
+  WEB_ENABLED=false; WEB_ADMIN_PASSWORD=''; WEB_ARGS=(); CONFIG_ARGS=(); REQUIRE_MANAGED_INSTANCE=false
+  rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new" "${MANAGEMENT_MODE_FILE}.new" \
+    "${MANAGED_INSTANCE_ID_FILE}.new" "$NETWORK_CONFIG_CANDIDATE"
+  current_mode=$(current_management_mode)
+  [[ $current_mode == web ]] && management_default=2 || management_default=1
+
   printf '\n%s\n' '========== EasyTier 小白配置向导 =========='
   printf '%s\n' \
-    '请选择节点接入方式：' \
-    '  1) 私有网络（推荐）：只允许网络名称和网络密钥都相同的节点连接；其他网络不能通过本机中转' \
-    '  2) IP + 端口开放连接（公共共享 / 中继）：其他 EasyTier 网络知道本机 IP 和监听端口即可连接并使用本机中继'
+    '请选择主机参数由谁管理：' \
+    '  1) 安装器管理（默认）：以后用 sudo easytier-installer --configure 修改；Web 面板可查看，但不能改这台主机' \
+    '  2) Web 完全管理：安装器安全迁移一次，之后可在 Web 面板修改、启动、停用或删除网络'
   while :; do
-    ask access_choice '请选择接入方式（1/2）' '1'
-    case $access_choice in
-      1) access_mode=private; break;;
+    ask management_choice '请选择管理模式（1/2）' "$management_default"
+    case $management_choice in
+      1) MANAGEMENT_MODE=installer; break;;
       2)
-        warn '已选择公共共享 / 中继模式：陌生网络不会自动加入你的私有网络，但可使用本机带宽进行握手和中转。请只在有意提供共享节点时启用。'
-        warn '该模式可能产生大量带宽、CPU、内存和连接数消耗，也可能被扫描或滥用。请配置防火墙并监控流量。'
-        if yesno '确认将本机作为公共共享 / 中继节点？' n; then
-          access_mode=shared
-        else
-          access_mode=private
-          info '已改用私有网络模式。'
+        if [[ ! -x ${INSTALL_DIR}/easytier-web-embed ]]; then
+          warn '当前架构或安装包没有 Web 控制面板组件，不能启用 Web 完全管理。'
+          management_default=1
+          continue
         fi
+        MANAGEMENT_MODE=web
         break;;
       *) warn '请输入 1 或 2。';;
     esac
   done
-  echo '本机所在网络里的设备：网络名称和网络密钥必须相同，固定虚拟 IP 不能重复。带 [默认值] 的项目直接回车即可。'
-  if [[ $access_mode == shared ]]; then
-    info '下面的网络名称和密钥是本共享节点自己的身份；外部网络连接本机中继时不需要知道它们，但仍需使用外部网络自己的名称和密钥。'
-  fi
-  ask network '网络名称（英文、数字、点、下划线、短横线）' 'my-easytier'
-  while [[ ! $network =~ ^[A-Za-z0-9._-]{1,64}$ ]]; do warn '网络名称格式不正确。'; ask network '请重新输入网络名称' 'my-easytier'; done
-  default_secret=$(generate_default_secret)
-  while :; do
-    ask secret '网络密钥（明文显示；直接回车使用自动生成值，至少 8 位）' "$default_secret"
-    [[ $secret != *$'\n'* && $secret != *$'\r'* ]] && ((${#secret} >= 8)) && break
-    warn '密钥至少 8 位且不能包含换行。'
-  done
-  if yesno '使用 DHCP 自动分配虚拟 IP？' y; then mode=dhcp; ipv4=''; else
-    mode=fixed
-    while :; do ask ipv4 '本设备的虚拟 IPv4（例如 10.126.126.2）' ''; valid_ipv4 "$ipv4" && break; warn 'IPv4 必须由 4 个 0-255 的数字组成。'; done
-  fi
-  ask hostname '设备名称' "$(hostname | tr -cd 'A-Za-z0-9._-')"
-  [[ $hostname =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die '设备名称格式不正确。'
-  ask protocols '监听协议，逗号分隔（tcp,udp,ws,wss,wg,quic,faketcp）' 'tcp,udp'
-  IFS=',' read -r -a proto_items <<< "$protocols"
-  for proto in "${proto_items[@]}"; do
-    proto=${proto//[[:space:]]/}; [[ $proto =~ ^(tcp|udp|ws|wss|wg|quic|faketcp)$ ]] || die "不支持的监听协议：${proto}"
-    [[ -z ${seen[$proto]+x} ]] || die "监听协议重复：${proto}"
-    seen[$proto]=1; normalized_protocols+=("$proto")
-  done
-  ((${#normalized_protocols[@]} > 0)) || die '至少选择一个监听协议。'
 
-  CONFIG_ARGS=(--instance-name "$MANAGED_INSTANCE_NAME" "--network-name=${network}" "--network-secret=${secret}" "--hostname=${hostname}")
-  if [[ $access_mode == private ]]; then
-    CONFIG_ARGS+=(--private-mode true --relay-network-whitelist "$network" --relay-all-peer-rpc false)
+  systemctl is-active --quiet easytier.service 2>/dev/null && core_active=true
+  if [[ $MANAGEMENT_MODE == web ]]; then
+    if [[ $current_mode == web ]]; then
+      configure_network=false
+      info '当前已是 Web 完全管理：将保留面板中的全部网络参数和网络文件，只调整本机 RPC / Web 端口。'
+    elif [[ -s $ARGS_FILE && $core_active == true && -x ${INSTALL_DIR}/easytier-cli ]]; then
+      configure_network=false; migrate_running=true
+      info '将从正在运行的安装器管理实例导出完整配置并迁移；切换后请在 Web 面板继续修改网络参数。'
+    else
+      info '未找到可导出的运行中旧实例，将由向导创建一个可在 Web 中继续修改的初始网络。'
+    fi
+  elif [[ $current_mode == web ]]; then
+    warn '正在切回安装器管理：Web 中的网络文件会安全保留但不再加载；请在下面重新填写要由安装器启动的主网络。'
+  fi
+
+  if [[ $configure_network == true ]]; then
+    printf '%s\n' \
+      '请选择节点接入方式：' \
+      '  1) 私有网络（推荐）：只允许网络名称和网络密钥都相同的节点连接；其他网络不能通过本机中转' \
+      '  2) IP + 端口开放连接（公共共享 / 中继）：其他 EasyTier 网络知道本机 IP 和监听端口即可连接并使用本机中继'
+    while :; do
+      ask access_choice '请选择接入方式（1/2）' '1'
+      case $access_choice in
+        1) access_mode=private; break;;
+        2)
+          warn '已选择公共共享 / 中继模式：陌生网络不会自动加入你的私有网络，但可使用本机带宽进行握手和中转。请只在有意提供共享节点时启用。'
+          warn '该模式可能产生大量带宽、CPU、内存和连接数消耗，也可能被扫描或滥用。请配置防火墙并监控流量。'
+          if yesno '确认将本机作为公共共享 / 中继节点？' n; then access_mode=shared
+          else access_mode=private; info '已改用私有网络模式。'; fi
+          break;;
+        *) warn '请输入 1 或 2。';;
+      esac
+    done
+    echo '本机所在网络里的设备：网络名称和网络密钥必须相同，固定虚拟 IP 不能重复。带 [默认值] 的项目直接回车即可。'
+    if [[ $access_mode == shared ]]; then
+      info '下面的网络名称和密钥是本共享节点自己的身份；外部网络连接本机中继时不需要知道它们，但仍需使用外部网络自己的名称和密钥。'
+    fi
+    ask network '网络名称（英文、数字、点、下划线、短横线）' 'my-easytier'
+    while [[ ! $network =~ ^[A-Za-z0-9._-]{1,64}$ ]]; do warn '网络名称格式不正确。'; ask network '请重新输入网络名称' 'my-easytier'; done
+    default_secret=$(generate_default_secret)
+    while :; do
+      ask secret '网络密钥（明文显示；直接回车使用自动生成值，至少 8 位）' "$default_secret"
+      if ((${#secret} >= 8)) && toml_escape "$secret" >/dev/null; then break; fi
+      warn '密钥至少 8 位，且不能包含换行或控制字符。'
+    done
+    if yesno '使用 DHCP 自动分配虚拟 IP？' y; then mode=dhcp; ipv4=''; else
+      mode=fixed
+      while :; do ask ipv4 '本设备的虚拟 IPv4（例如 10.126.126.2）' ''; valid_ipv4 "$ipv4" && break; warn 'IPv4 必须由 4 个 0-255 的数字组成。'; done
+    fi
+    ask hostname '设备名称' "$(hostname | tr -cd 'A-Za-z0-9._-')"
+    [[ $hostname =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die '设备名称格式不正确。'
+    ask protocols '监听协议，逗号分隔（tcp,udp,ws,wss,wg,quic,faketcp）' 'tcp,udp'
+    IFS=',' read -r -a proto_items <<< "$protocols"
+    for proto in "${proto_items[@]}"; do
+      proto=${proto//[[:space:]]/}; [[ $proto =~ ^(tcp|udp|ws|wss|wg|quic|faketcp)$ ]] || die "不支持的监听协议：${proto}"
+      [[ -z ${seen[$proto]+x} ]] || die "监听协议重复：${proto}"
+      seen[$proto]=1; normalized_protocols+=("$proto")
+    done
+    ((${#normalized_protocols[@]} > 0)) || die '至少选择一个监听协议。'
+
+    CONFIG_ARGS=(--instance-name "$MANAGED_INSTANCE_NAME" "--network-name=${network}" "--network-secret=${secret}" "--hostname=${hostname}")
+    if [[ $access_mode == private ]]; then
+      CONFIG_ARGS+=(--private-mode true --relay-network-whitelist "$network" --relay-all-peer-rpc false)
+    else
+      CONFIG_ARGS+=(--private-mode false --relay-network-whitelist '*' --relay-all-peer-rpc false)
+    fi
+    [[ $mode == dhcp ]] && CONFIG_ARGS+=(--dhcp) || CONFIG_ARGS+=(--ipv4 "$ipv4")
+    echo '下面为每种协议设置端口；同类协议不能占用同一个端口。'
+    for proto in "${normalized_protocols[@]}"; do
+      default_port=$(protocol_default_port "$proto"); family=$(protocol_family "$proto")
+      while :; do
+        ask port "${proto} 监听端口" "$default_port"
+        if ! valid_port "$port"; then warn '端口必须在 1-65535 之间。'; continue; fi
+        key="${family}:${port}"
+        if [[ -n ${used[$key]+x} ]]; then warn "${port} 已被同为 ${family^^} 的 ${used[$key]} 使用，请换一个端口。"; continue; fi
+        used[$key]=$proto; CONFIG_ARGS+=(--listeners "${proto}://0.0.0.0:${port}"); break
+      done
+    done
+
+    ask peers '主动连接节点，逗号分隔；没有可留空（例 tcp://1.2.3.4:11010）' ''
+    ask external '公共共享节点 URL（没有可留空）' ''
+    ask proxy_nets '共享给其他设备的本地网段，逗号分隔（例 192.168.1.0/24）' ''
+    while :; do
+      ask rpc_port '本机管理 RPC 端口（仅监听 127.0.0.1）' '15888'
+      valid_port "$rpc_port" || { warn '端口必须在 1-65535 之间。'; continue; }
+      [[ -z ${used[tcp:$rpc_port]+x} ]] && break; warn 'RPC 端口与 TCP 类监听端口冲突。'
+    done
+    used["tcp:$rpc_port"]='本机 RPC'
+    while :; do
+      ask socks5 'SOCKS5 端口（留空表示不开启）' ''
+      [[ -z $socks5 ]] && break
+      valid_port "$socks5" || { warn '端口必须在 1-65535 之间。'; continue; }
+      [[ $socks5 != "$rpc_port" && -z ${used[tcp:$socks5]+x} ]] && break; warn 'SOCKS5 端口与其他 TCP 端口冲突。'
+    done
+    [[ -z $socks5 ]] || used["tcp:$socks5"]='SOCKS5'
+    ask compression '压缩方式（none/zstd）' 'none'
+    [[ $compression == none || $compression == zstd ]] || die '压缩方式只能是 none 或 zstd。'
+    append_csv_args --peers "$peers"
+    [[ -n $external ]] && CONFIG_ARGS+=(--external-node "$external")
+    append_csv_args --proxy-networks "$proxy_nets"
+    CONFIG_ARGS+=(--rpc-portal "127.0.0.1:${rpc_port}" --compression "$compression")
+    [[ -n $socks5 ]] && CONFIG_ARGS+=(--socks5 "$socks5")
+
+    if yesno '配置 WireGuard VPN 入口？' n; then
+      while :; do
+        ask vpn_port 'WireGuard 入口 UDP 端口' '11020'
+        valid_port "$vpn_port" || { warn '端口必须在 1-65535 之间。'; continue; }
+        [[ -z ${used[udp:$vpn_port]+x} ]] && break; warn '此 UDP 端口已被监听协议使用。'
+      done
+      while :; do
+        ask vpn_cidr 'WireGuard 客户端 IPv4 网段' '10.14.14.0/24'
+        valid_ipv4_cidr "$vpn_cidr" && break; warn '请输入有效的 IPv4 CIDR（例如 10.14.14.0/24）。'
+      done
+      CONFIG_ARGS+=(--vpn-portal "wg://0.0.0.0:${vpn_port}/${vpn_cidr}")
+      used["udp:$vpn_port"]='WireGuard 入口'
+    fi
+    if yesno '启用多线程？（服务器或多连接设备建议开启）' y; then
+      CONFIG_ARGS+=(--multi-thread true)
+    else
+      CONFIG_ARGS+=(--multi-thread false)
+    fi
+    yesno '启用延迟优先选路？' y && CONFIG_ARGS+=(--latency-first)
+    yesno '禁用 IPv6？' n && CONFIG_ARGS+=(--disable-ipv6)
   else
-    CONFIG_ARGS+=(--private-mode false --relay-network-whitelist '*' --relay-all-peer-rpc false)
+    old_rpc_address=$(arg_value_from_file "$ARGS_FILE" --rpc-portal 2>/dev/null || true)
+    rpc_default=${old_rpc_address##*:}; valid_port "$rpc_default" || rpc_default=15888
+    while :; do
+      ask rpc_port '本机管理 RPC 端口（仅监听 127.0.0.1）' "$rpc_default"
+      valid_port "$rpc_port" && break
+      warn '端口必须在 1-65535 之间。'
+    done
+    used["tcp:$rpc_port"]='本机 RPC'
+    CONFIG_ARGS=(--rpc-portal "127.0.0.1:${rpc_port}")
   fi
-  [[ $mode == dhcp ]] && CONFIG_ARGS+=(--dhcp) || CONFIG_ARGS+=(--ipv4 "$ipv4")
-  echo '下面为每种协议设置端口；同类协议不能占用同一个端口。'
-  for proto in "${normalized_protocols[@]}"; do
-    default_port=$(protocol_default_port "$proto"); family=$(protocol_family "$proto")
-    while :; do
-      ask port "${proto} 监听端口" "$default_port"
-      if ! valid_port "$port"; then warn '端口必须在 1-65535 之间。'; continue; fi
-      key="${family}:${port}"
-      if [[ -n ${used[$key]+x} ]]; then warn "${port} 已被同为 ${family^^} 的 ${used[$key]} 使用，请换一个端口。"; continue; fi
-      used[$key]=$proto; CONFIG_ARGS+=(--listeners "${proto}://0.0.0.0:${port}"); break
-    done
-  done
 
-  ask peers '主动连接节点，逗号分隔；没有可留空（例 tcp://1.2.3.4:11010）' ''
-  ask external '公共共享节点 URL（没有可留空）' ''
-  ask proxy_nets '共享给其他设备的本地网段，逗号分隔（例 192.168.1.0/24）' ''
-  while :; do
-    ask rpc_port '本机管理 RPC 端口（仅监听 127.0.0.1）' '15888'
-    valid_port "$rpc_port" || { warn '端口必须在 1-65535 之间。'; continue; }
-    [[ -z ${used[tcp:$rpc_port]+x} ]] && break; warn 'RPC 端口与 TCP 类监听端口冲突。'
-  done
-  used["tcp:$rpc_port"]='本机 RPC'
-  while :; do
-    ask socks5 'SOCKS5 端口（留空表示不开启）' ''
-    [[ -z $socks5 ]] && break
-    valid_port "$socks5" || { warn '端口必须在 1-65535 之间。'; continue; }
-    [[ $socks5 != "$rpc_port" && -z ${used[tcp:$socks5]+x} ]] && break; warn 'SOCKS5 端口与其他 TCP 端口冲突。'
-  done
-  [[ -z $socks5 ]] || used["tcp:$socks5"]='SOCKS5'
-  ask compression '压缩方式（none/zstd）' 'none'
-  [[ $compression == none || $compression == zstd ]] || die '压缩方式只能是 none 或 zstd。'
-  append_csv_args --peers "$peers"
-  [[ -n $external ]] && CONFIG_ARGS+=(--external-node "$external")
-  append_csv_args --proxy-networks "$proxy_nets"
-  CONFIG_ARGS+=(--rpc-portal "127.0.0.1:${rpc_port}" --compression "$compression")
-  [[ -n $socks5 ]] && CONFIG_ARGS+=(--socks5 "$socks5")
-
-  if yesno '配置 WireGuard VPN 入口？' n; then
-    while :; do
-      ask vpn_port 'WireGuard 入口 UDP 端口' '11020'
-      valid_port "$vpn_port" || { warn '端口必须在 1-65535 之间。'; continue; }
-      [[ -z ${used[udp:$vpn_port]+x} ]] && break; warn '此 UDP 端口已被监听协议使用。'
-    done
-    while :; do
-      ask vpn_cidr 'WireGuard 客户端 IPv4 网段' '10.14.14.0/24'
-      valid_ipv4_cidr "$vpn_cidr" && break; warn '请输入有效的 IPv4 CIDR（例如 10.14.14.0/24）。'
-    done
-    CONFIG_ARGS+=(--vpn-portal "wg://0.0.0.0:${vpn_port}/${vpn_cidr}")
-    used["udp:$vpn_port"]='WireGuard 入口'
-  fi
-  yesno '启用多线程？（服务器或多连接设备建议开启）' y && CONFIG_ARGS+=(--multi-thread)
-  yesno '启用延迟优先选路？' y && CONFIG_ARGS+=(--latency-first)
-  yesno '禁用 IPv6？' n && CONFIG_ARGS+=(--disable-ipv6)
+  old_web_bind=$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-addr 2>/dev/null || true)
+  [[ $old_web_bind == 0.0.0.0 ]] && web_access_default=2
+  candidate=$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-port 2>/dev/null || true); valid_port "$candidate" && web_port_default=$candidate
+  candidate=$(arg_value_from_file "$WEB_ARGS_FILE" --config-server-protocol 2>/dev/null || true); [[ $candidate =~ ^(udp|tcp|ws)$ ]] && web_config_proto_default=$candidate
+  candidate=$(arg_value_from_file "$WEB_ARGS_FILE" --config-server-port 2>/dev/null || true); valid_port "$candidate" && web_config_port_default=$candidate
 
   if [[ ! -x ${INSTALL_DIR}/easytier-web-embed ]]; then
+    [[ $MANAGEMENT_MODE != web ]] || die 'Web 完全管理必须安装 Web 控制面板组件。'
     warn '当前安装包没有 Web 控制面板组件，将继续使用 Core/CLI。'
-  elif yesno '启用 Web 控制面板？' y; then
+  elif [[ $MANAGEMENT_MODE == web ]] || yesno '启用 Web 控制面板？' y; then
     WEB_ENABLED=true
+    [[ $MANAGEMENT_MODE != web ]] || info 'Web 完全管理模式会强制启用控制面板。'
     printf '%s\n' \
       'Web 访问范围：' \
       '  1) 仅本机（推荐；通过 SSH 隧道访问，不向公网暴露）' \
       '  2) 局域网 / 公网直接访问（需要防火墙或安全组放行）'
     while :; do
-      ask web_access '请选择访问范围（1/2）' '1'
+      ask web_access '请选择访问范围（1/2）' "$web_access_default"
       [[ $web_access == 1 || $web_access == 2 ]] && break
       warn '请输入 1 或 2。'
     done
-    if [[ $web_access == 1 ]]; then
-      web_bind=127.0.0.1
-    else
-      web_bind=0.0.0.0
-      warn '控制面板使用 HTTP。公网使用时请限制来源 IP，并建议在前面配置 HTTPS 反向代理。'
-    fi
+    if [[ $web_access == 1 ]]; then web_bind=127.0.0.1
+    else web_bind=0.0.0.0; warn '控制面板使用 HTTP。公网使用时请限制来源 IP，并建议在前面配置 HTTPS 反向代理。'; fi
     while :; do
-      ask web_port 'Web 控制面板 TCP 端口' '11211'
+      ask web_port 'Web 控制面板 TCP 端口' "$web_port_default"
       valid_port "$web_port" || { warn '端口必须在 1-65535 之间。'; continue; }
       if [[ -n ${used[tcp:$web_port]+x} ]]; then warn "此 TCP 端口已被 ${used[tcp:$web_port]} 使用。"; continue; fi
       if port_is_listening tcp "$web_port" && ! existing_web_owns_port tcp "$web_port"; then
@@ -747,20 +1144,19 @@ configure() {
           [[ -z ${used[tcp:$candidate]+x} ]] && break
           candidate=$((10#$candidate + 1))
         done
-        web_port=$candidate
-        warn "检测到 TCP ${original_port} 已被其他程序占用，Web 面板已自动改用 ${web_port}。"
+        web_port=$candidate; warn "检测到 TCP ${original_port} 已被其他程序占用，Web 面板已自动改用 ${web_port}。"
       fi
       break
     done
     used["tcp:$web_port"]='Web 控制面板'
     while :; do
-      ask web_config_proto 'Core 连接控制面板的协议（udp/tcp/ws）' 'udp'
+      ask web_config_proto 'Core 连接控制面板的协议（udp/tcp/ws）' "$web_config_proto_default"
       [[ $web_config_proto =~ ^(udp|tcp|ws)$ ]] && break
       warn '协议只能是 udp、tcp 或 ws。'
     done
     web_family=$(protocol_family "$web_config_proto")
     while :; do
-      ask web_config_port '控制面板配置下发端口（通常无需在安全组放行）' '22020'
+      ask web_config_port '控制面板配置下发端口（通常无需在安全组放行）' "$web_config_port_default"
       valid_port "$web_config_port" || { warn '端口必须在 1-65535 之间。'; continue; }
       key="${web_family}:${web_config_port}"
       if [[ -n ${used[$key]+x} ]]; then warn "此 ${web_family^^} 端口已被 ${used[$key]} 使用。"; continue; fi
@@ -778,16 +1174,9 @@ configure() {
       break
     done
     used["$key"]='Web 配置下发'
-    CONFIG_ARGS+=(--config-server "${web_config_proto}://127.0.0.1:${web_config_port}/admin")
-    WEB_ARGS=(
-      --db "$WEB_DB_FILE"
-      --api-server-addr "$web_bind"
-      --api-server-port "$web_port"
-      --config-server-protocol "$web_config_proto"
-      --config-server-port "$web_config_port"
-      --disable-registration
-      --console-log-level info
-    )
+    WEB_ARGS=(--db "$WEB_DB_FILE" --api-server-addr "$web_bind" --api-server-port "$web_port" \
+      --config-server-protocol "$web_config_proto" --config-server-port "$web_config_port" \
+      --disable-registration --console-log-level info)
     if [[ ! -s $WEB_DB_FILE ]]; then
       web_default_password=$(generate_default_secret)
       while :; do
@@ -798,33 +1187,63 @@ configure() {
     else
       info '检测到已有 Web 账户数据库，将保留当前登录密码。'
     fi
+
+    machine_id=$(ensure_stable_machine_id)
+    if [[ $MANAGEMENT_MODE == web ]]; then
+      if [[ $migrate_running == true ]]; then
+        [[ -n $old_rpc_address ]] || die '旧配置缺少本机 RPC 地址，无法自动迁移。'
+        export_running_network_candidate "$old_rpc_address"
+      elif [[ $configure_network == true ]]; then
+        instance_id=$(managed_instance_id)
+        render_network_toml_from_args "$NETWORK_CONFIG_CANDIDATE" "$instance_id" || die '无法生成安全的 Web 管理网络配置。'
+        printf '%s\n' "$instance_id" > "${MANAGED_INSTANCE_ID_FILE}.new"
+        chmod 0600 "${MANAGED_INSTANCE_ID_FILE}.new"
+        REQUIRE_MANAGED_INSTANCE=true
+      fi
+      CONFIG_ARGS=(--daemon --disable-env-parsing --rpc-portal "127.0.0.1:${rpc_port}" \
+        --config-dir "$NETWORK_CONFIG_DIR" \
+        --config-server "${web_config_proto}://127.0.0.1:${web_config_port}/admin" \
+        "--machine-id=${machine_id}")
+    else
+      CONFIG_ARGS+=(--config-server "${web_config_proto}://127.0.0.1:${web_config_port}/admin" "--machine-id=${machine_id}")
+    fi
   fi
 
-  echo '高级用户可逐行加入 EasyTier 原生参数；每行一个参数或值，直接回车结束。'
-  while :; do
-    ask extra '附加参数（回车结束）' ''
-    [[ -z $extra ]] && break
-    [[ $extra != *$'\n'* && $extra != *$'\r'* ]] || die '参数不能包含换行。'
-    case $extra in
-      --network-name|--network-name=*|--network-secret|--network-secret=*|--hostname|--hostname=*|\
-      --instance-name|--instance-name=*|-m|-m?*|\
-      --dhcp|--dhcp=*|-d|-d?*|--ipv4|--ipv4=*|-i|-i?*|-p|-p?*|--peers|--peers=*|-e|-e?*|--external-node|--external-node=*|\
-      -n|-n?*|--proxy-networks|--proxy-networks=*|--listeners|--listeners=*|-l|-l?*|--no-listener|\
-      --rpc-portal|--rpc-portal=*|-r|-r?*|--socks5|--socks5=*|--vpn-portal|--vpn-portal=*|\
-      --config-server|--config-server=*|-w|-w?*|\
-      --compression|--compression=*|--multi-thread|--multi-thread=*|--latency-first|--latency-first=*|--disable-ipv6|--disable-ipv6=*|\
-      --private-mode|--private-mode=*|--relay-network-whitelist|--relay-network-whitelist=*|--relay-all-peer-rpc|--relay-all-peer-rpc=*)
-        warn '此参数已由向导管理，不能在高级参数中重复添加。'; continue;;
-    esac
-    CONFIG_ARGS+=("$extra")
-  done
-  install -d -m 0700 "$CONFIG_DIR"
+  if [[ $MANAGEMENT_MODE == web ]]; then
+    info 'Web 完全管理模式下，高级网络参数请在 Web 面板修改，避免命令行覆盖后重新变成只读。'
+  else
+    echo '高级用户可逐行加入 EasyTier 原生参数；每行一个参数或值，直接回车结束。'
+    while :; do
+      ask extra '附加参数（回车结束）' ''
+      [[ -z $extra ]] && break
+      [[ $extra != *$'\n'* && $extra != *$'\r'* ]] || die '参数不能包含换行。'
+      case $extra in
+        --network-name|--network-name=*|--network-secret|--network-secret=*|--hostname|--hostname=*|\
+        --instance-name|--instance-name=*|-m|-m?*|--machine-id|--machine-id=*|--config-dir|--config-dir=*|--daemon|--disable-env-parsing|\
+        --dhcp|--dhcp=*|-d|-d?*|--ipv4|--ipv4=*|-i|-i?*|-p|-p?*|--peers|--peers=*|-e|-e?*|--external-node|--external-node=*|\
+        -n|-n?*|--proxy-networks|--proxy-networks=*|--listeners|--listeners=*|-l|-l?*|--no-listener|\
+        --rpc-portal|--rpc-portal=*|-r|-r?*|--socks5|--socks5=*|--vpn-portal|--vpn-portal=*|\
+        --config-server|--config-server=*|-w|-w?*|\
+        --compression|--compression=*|--multi-thread|--multi-thread=*|--latency-first|--latency-first=*|--disable-ipv6|--disable-ipv6=*|\
+        --private-mode|--private-mode=*|--relay-network-whitelist|--relay-network-whitelist=*|--relay-all-peer-rpc|--relay-all-peer-rpc=*)
+          warn '此参数已由向导管理，不能在高级参数中重复添加。'; continue;;
+      esac
+      CONFIG_ARGS+=("$extra")
+    done
+  fi
+
+  ensure_private_directory "$CONFIG_DIR" || die "无法创建安全配置目录：${CONFIG_DIR}"
+  printf '%s\n' "$MANAGEMENT_MODE" > "${MANAGEMENT_MODE_FILE}.new"; chmod 0600 "${MANAGEMENT_MODE_FILE}.new"
   printf '%s\n' "${CONFIG_ARGS[@]}" > "${ARGS_FILE}.new"; chmod 0600 "${ARGS_FILE}.new"
   if [[ $WEB_ENABLED == true ]]; then
     printf '%s\n' "${WEB_ARGS[@]}" > "${WEB_ARGS_FILE}.new"; chmod 0600 "${WEB_ARGS_FILE}.new"
   fi
-  validate_config_candidate "${INSTALL_DIR}/easytier-core" || { rm -f -- "${ARGS_FILE}.new"; die '参数检查失败，旧配置未改动。'; }
-  ok '参数检查通过，等待启动验证。'
+  if ! validate_config_candidate "${INSTALL_DIR}/easytier-core"; then
+    rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new" "${MANAGEMENT_MODE_FILE}.new" \
+      "${MANAGED_INSTANCE_ID_FILE}.new" "$NETWORK_CONFIG_CANDIDATE"
+    die '参数或 TOML 检查失败，旧配置未改动。'
+  fi
+  ok '参数与管理模式检查通过，等待启动验证。'
 }
 
 write_atomic() {
@@ -855,12 +1274,14 @@ write_units() {
   write_atomic "$RUNNER_PATH" 0755 <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
+while IFS= read -r name; do [[ \$name != ET_* ]] || unset "\$name"; done < <(compgen -e)
 mapfile -t args < ${ARGS_FILE}
 exec ${INSTALL_DIR}/easytier-core "\${args[@]}"
 EOF
   write_atomic "$WEB_RUNNER_PATH" 0755 <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
+while IFS= read -r name; do [[ \$name != ET_* ]] || unset "\$name"; done < <(compgen -e)
 mapfile -t args < ${WEB_ARGS_FILE}
 exec ${INSTALL_DIR}/easytier-web-embed "\${args[@]}"
 EOF
@@ -875,6 +1296,7 @@ Type=simple
 ExecStart=${RUNNER_PATH}
 Restart=on-failure
 RestartSec=5s
+UMask=0077
 LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
@@ -1311,6 +1733,7 @@ redact_sensitive_lines() {
     } else {
       print
     }
+    fflush()
   }'
 }
 
@@ -1452,13 +1875,14 @@ json_array_field() {
 }
 
 verify_runtime_config() {
-  local rpc='' instance_name='' listener output='' listeners_json='' i rpc_ok=false
+  local rpc='' instance_name='' listener output='' listeners_json='' i rpc_ok=false mode='' instance_id='' target=''
   local -a args expected=() cli_args=()
   [[ -r $ARGS_FILE && -x ${INSTALL_DIR}/easytier-cli ]] || { warn '缺少运行配置或 easytier-cli，无法完成健康检查。'; return 1; }
   mapfile -t args < "$ARGS_FILE" || return 1
   for ((i=0; i<${#args[@]}; i++)); do
     case ${args[$i]} in
       --rpc-portal) ((i+1 < ${#args[@]})) || return 1; rpc=${args[$((i+1))]}; ((i+=1));;
+      --rpc-portal=*) rpc=${args[$i]#*=};;
       --instance-name) ((i+1 < ${#args[@]})) || return 1; instance_name=${args[$((i+1))]}; ((i+=1));;
       --instance-name=*) instance_name=${args[$i]#*=};;
       --listeners) ((i+1 < ${#args[@]})) || return 1; expected+=("${args[$((i+1))]}"); ((i+=1));;
@@ -1466,12 +1890,36 @@ verify_runtime_config() {
   done
   [[ -n $rpc ]] || { warn '新配置中缺少本机 RPC 地址，无法检查 Core。'; return 1; }
   cli_args=(-p "$rpc" -o json)
-  [[ -z $instance_name ]] || cli_args+=(-n "$instance_name")
+  mode=$(current_management_mode)
+  if [[ $mode == web ]]; then
+    grep -Fxq -- '--daemon' "$ARGS_FILE" || { warn 'Web 管理模式缺少 --daemon，无法保证空网络时 Core 持续运行。'; return 1; }
+    [[ $(arg_value_from_file "$ARGS_FILE" --config-dir 2>/dev/null || true) == "$NETWORK_CONFIG_DIR" ]] || return 1
+    if [[ $REQUIRE_MANAGED_INSTANCE == true ]]; then
+      instance_id=$(read_uuid_file "$MANAGED_INSTANCE_ID_FILE" 2>/dev/null || true)
+      [[ -n $instance_id ]] || { warn 'Web 管理迁移缺少主网络 instance-id。'; return 1; }
+      target="${NETWORK_CONFIG_DIR}/${instance_id}.toml"
+      [[ -f $target && ! -L $target ]] || { warn 'Web 管理主网络配置文件未正确落盘。'; return 1; }
+      cli_args+=(-i "$instance_id")
+    fi
+  else
+    [[ -z $instance_name ]] || cli_args+=(-n "$instance_name")
+  fi
   for ((i=0; i<5; i++)); do
-    if output=$("${INSTALL_DIR}/easytier-cli" "${cli_args[@]}" node 2>/dev/null); then rpc_ok=true; break; fi
+    if output=$("${INSTALL_DIR}/easytier-cli" "${cli_args[@]}" node 2>&1); then
+      rpc_ok=true
+      break
+    fi
+    # Web 完全管理允许用户删除或停用全部网络。无 selector 时，这条精确错误
+    # 只会在 CLI 已成功连上管理 RPC、且 Core 返回空实例列表后出现。
+    if [[ $mode == web && $REQUIRE_MANAGED_INSTANCE != true && $output == *'no running instances found'* ]]; then
+      rpc_ok=true
+      output='{}'
+      break
+    fi
     sleep 1
   done
   [[ $rpc_ok == true && -n $output ]] || { warn "Core 已启动，但本机 RPC ${rpc} 在检查期限内没有响应。"; return 1; }
+  [[ $mode != web ]] || return 0
   if ! listeners_json=$(printf '%s\n' "$output" | json_array_field listeners); then
     warn 'Core RPC 返回内容中缺少可解析的监听器状态。'
     return 1
@@ -1507,48 +1955,122 @@ start_service_checked() {
   return 1
 }
 
+create_config_snapshot() {
+  local backup source name
+  [[ ! -L $CONFIG_DIR ]] || return 1
+  ensure_private_directory "$CONFIG_DIR" || return 1
+  backup=$(mktemp -d "${CONFIG_DIR}/.activate-backup.XXXXXX") || return 1
+  chmod 0700 "$backup" || { rmdir -- "$backup" 2>/dev/null || true; return 1; }
+  for source in "$ARGS_FILE" "$WEB_ARGS_FILE" "$MANAGEMENT_MODE_FILE" "$MANAGED_INSTANCE_ID_FILE" \
+    "$WEB_DB_FILE" "${WEB_DB_FILE}-wal" "${WEB_DB_FILE}-shm" "${WEB_DB_FILE}-journal"; do
+    [[ -e $source || -L $source ]] || continue
+    [[ -f $source && ! -L $source ]] || { [[ $backup == "${CONFIG_DIR}/.activate-backup."* ]] && rm -rf -- "$backup"; return 1; }
+    name=${source##*/}
+    cp -a -- "$source" "${backup}/${name}" || { [[ $backup == "${CONFIG_DIR}/.activate-backup."* ]] && rm -rf -- "$backup"; return 1; }
+  done
+  if [[ -e $NETWORK_CONFIG_DIR || -L $NETWORK_CONFIG_DIR ]]; then
+    [[ -d $NETWORK_CONFIG_DIR && ! -L $NETWORK_CONFIG_DIR ]] || { [[ $backup == "${CONFIG_DIR}/.activate-backup."* ]] && rm -rf -- "$backup"; return 1; }
+    cp -a -- "$NETWORK_CONFIG_DIR" "${backup}/networks" || { [[ $backup == "${CONFIG_DIR}/.activate-backup."* ]] && rm -rf -- "$backup"; return 1; }
+  fi
+  printf '%s\n' "$backup"
+}
+
+valid_config_snapshot_path() {
+  [[ $1 == "${CONFIG_DIR}/.activate-backup."* && $1 != "$CONFIG_DIR" && -d $1 && ! -L $1 ]]
+}
+
+remove_config_snapshot() {
+  local backup=$1
+  valid_config_snapshot_path "$backup" || return 1
+  rm -rf -- "$backup"
+}
+
+restore_config_snapshot() {
+  local backup=$1 source name
+  valid_config_snapshot_path "$backup" || return 1
+  [[ $NETWORK_CONFIG_DIR == "${CONFIG_DIR}/networks" && $CONFIG_DIR != / ]] || return 1
+  rm -f -- "$ARGS_FILE" "$WEB_ARGS_FILE" "$MANAGEMENT_MODE_FILE" "$MANAGED_INSTANCE_ID_FILE" \
+    "$WEB_DB_FILE" "${WEB_DB_FILE}-wal" "${WEB_DB_FILE}-shm" "${WEB_DB_FILE}-journal" \
+    "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new" "${MANAGEMENT_MODE_FILE}.new" \
+    "${MANAGED_INSTANCE_ID_FILE}.new" "$NETWORK_CONFIG_CANDIDATE"
+  rm -rf -- "$NETWORK_CONFIG_DIR"
+  for source in "$backup"/*; do
+    [[ -e $source ]] || continue
+    name=${source##*/}
+    [[ $name != networks ]] || continue
+    cp -a -- "$source" "${CONFIG_DIR}/${name}" || return 1
+  done
+  if [[ -d ${backup}/networks ]]; then cp -a -- "${backup}/networks" "$NETWORK_CONFIG_DIR" || return 1; fi
+}
+
+apply_config_candidates() {
+  local mode='' instance_id='' target=''
+  mv -f -- "${ARGS_FILE}.new" "$ARGS_FILE" || return 1
+  chmod 0600 "$ARGS_FILE" || return 1
+  if [[ -f ${WEB_ARGS_FILE}.new ]]; then
+    mv -f -- "${WEB_ARGS_FILE}.new" "$WEB_ARGS_FILE" || return 1
+    chmod 0600 "$WEB_ARGS_FILE" || return 1
+  else
+    rm -f -- "$WEB_ARGS_FILE" || return 1
+  fi
+  mv -f -- "${MANAGEMENT_MODE_FILE}.new" "$MANAGEMENT_MODE_FILE" || return 1
+  chmod 0600 "$MANAGEMENT_MODE_FILE" || return 1
+  IFS= read -r mode < "$MANAGEMENT_MODE_FILE" || return 1
+  if [[ -f ${MANAGED_INSTANCE_ID_FILE}.new ]]; then
+    mv -f -- "${MANAGED_INSTANCE_ID_FILE}.new" "$MANAGED_INSTANCE_ID_FILE" || return 1
+    chmod 0600 "$MANAGED_INSTANCE_ID_FILE" || return 1
+  fi
+  if [[ $mode == web ]]; then
+    prepare_network_config_dir || return 1
+    if [[ -f $NETWORK_CONFIG_CANDIDATE ]]; then
+      instance_id=$(read_uuid_file "$MANAGED_INSTANCE_ID_FILE" 2>/dev/null || true)
+      [[ -n $instance_id ]] || return 1
+      target="${NETWORK_CONFIG_DIR}/${instance_id}.toml"
+      [[ ! -L $target ]] || return 1
+      mv -f -- "$NETWORK_CONFIG_CANDIDATE" "${target}.new" || return 1
+      chmod 0600 "${target}.new" || return 1
+      mv -f -- "${target}.new" "$target" || return 1
+    fi
+  elif [[ $mode != installer ]]; then
+    return 1
+  fi
+}
+
 activate_config() {
-  local core_backup="${ARGS_FILE}.backup.$$" web_backup="${WEB_ARGS_FILE}.backup.$$"
-  local had_core=false had_web=false had_web_db=false core_active=false core_enabled=false web_active=false web_enabled=false
-  local files_ready=false failure_stage='写入配置文件'
+  local snapshot='' core_active=false core_enabled=false web_active=false web_enabled=false
+  local failure_stage='停止旧服务' restored=true
   systemctl is-active --quiet easytier.service && core_active=true
   systemctl is-enabled --quiet easytier.service && core_enabled=true
   systemctl is-active --quiet easytier-web.service && web_active=true
   systemctl is-enabled --quiet easytier-web.service && web_enabled=true
-  [[ -s $WEB_DB_FILE ]] && had_web_db=true
-  if [[ -f $ARGS_FILE ]]; then cp -a -- "$ARGS_FILE" "$core_backup" || return 1; had_core=true; fi
-  if [[ -f $WEB_ARGS_FILE ]]; then cp -a -- "$WEB_ARGS_FILE" "$web_backup" || { rm -f -- "$core_backup"; return 1; }; had_web=true; fi
-
-  if [[ $BINARY_CHANGED == true && $web_active == true ]]; then
-    if ! systemctl stop easytier-web.service || ! backup_web_database_for_transaction; then
-      warn '无法安全备份 Web 账户数据库，已中止本次替换。'
-      rm -f -- "$core_backup" "$web_backup"
-      return 1
-    fi
+  if [[ $core_active == true ]] && ! systemctl stop easytier.service; then return 1; fi
+  if [[ $web_active == true ]] && ! systemctl stop easytier-web.service; then
+    [[ $core_active != true ]] || systemctl start easytier.service >/dev/null 2>&1 || true
+    return 1
+  fi
+  snapshot=$(create_config_snapshot) || {
+    [[ $web_active != true ]] || systemctl start easytier-web.service >/dev/null 2>&1 || true
+    [[ $core_active != true ]] || systemctl start easytier.service >/dev/null 2>&1 || true
+    return 1
+  }
+  if [[ $BINARY_CHANGED == true && $web_active == true ]] && ! backup_web_database_for_transaction; then
+    warn '无法安全备份 Web 账户数据库，已中止本次替换。'
+    remove_config_snapshot "$snapshot" || true
+    [[ $web_active != true ]] || systemctl start easytier-web.service >/dev/null 2>&1 || true
+    [[ $core_active != true ]] || systemctl start easytier.service >/dev/null 2>&1 || true
+    return 1
   fi
 
-  if [[ $WEB_ENABLED == true && -n $WEB_ADMIN_PASSWORD ]]; then
-    systemctl stop easytier-web.service >/dev/null 2>&1 || true
-    if ! bootstrap_web_admin_password; then
-      if [[ $web_active == true ]]; then systemctl start easytier-web.service >/dev/null 2>&1 || true; fi
-      [[ $web_enabled == true ]] || systemctl disable easytier-web.service >/dev/null 2>&1 || true
-      rm -f -- "$core_backup" "$web_backup"
-      return 1
-    fi
-  fi
-
-  if mv -f -- "${ARGS_FILE}.new" "$ARGS_FILE" && chmod 0600 "$ARGS_FILE"; then
-    if [[ -f ${WEB_ARGS_FILE}.new ]]; then
-      if mv -f -- "${WEB_ARGS_FILE}.new" "$WEB_ARGS_FILE" && chmod 0600 "$WEB_ARGS_FILE"; then files_ready=true; fi
-    else
-      rm -f -- "$WEB_ARGS_FILE" && files_ready=true
-    fi
-    if [[ $files_ready == true ]]; then
+  failure_stage='初始化 Web 管理员账户'
+  if [[ $WEB_ENABLED != true || -z $WEB_ADMIN_PASSWORD ]] || bootstrap_web_admin_password; then
+    failure_stage='写入管理模式与网络配置'
+    if apply_config_candidates; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
       failure_stage='Web 控制面板'
       if start_web_service_checked; then
         failure_stage='EasyTier Core'
         if start_service_checked; then
-          rm -f -- "$core_backup" "$web_backup"
+          remove_config_snapshot "$snapshot" || warn "无法清理配置事务备份：${snapshot}"
           ok 'EasyTier 与 Web 控制面板配置已生效。'
           return 0
         fi
@@ -1558,23 +2080,23 @@ activate_config() {
 
   warn "失败阶段：${failure_stage}。"
   warn '新配置启动失败，正在自动恢复旧配置。'
-  rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new"
   systemctl stop easytier.service easytier-web.service >/dev/null 2>&1 || true
-  [[ $had_web_db == true ]] || remove_new_web_database
-  if [[ $had_core == true ]]; then mv -f -- "$core_backup" "$ARGS_FILE" || return 1; else rm -f -- "$ARGS_FILE" || return 1; fi
-  if [[ $had_web == true ]]; then mv -f -- "$web_backup" "$WEB_ARGS_FILE" || return 1; else rm -f -- "$WEB_ARGS_FILE" || return 1; fi
+  restore_config_snapshot "$snapshot" || restored=false
   systemctl reset-failed easytier.service easytier-web.service >/dev/null 2>&1 || true
-
-  if [[ $had_web == true && $web_active == true ]]; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  REQUIRE_MANAGED_INSTANCE=false
+  if [[ $restored == true && $web_active == true ]]; then
     systemctl start easytier-web.service >/dev/null 2>&1 || true
     wait_web_healthy || warn '旧 Web 控制面板未能恢复运行。'
   fi
   if [[ $web_enabled == true ]]; then systemctl enable easytier-web.service >/dev/null 2>&1 || true; else systemctl disable easytier-web.service >/dev/null 2>&1 || true; fi
-  if [[ $had_core == true && $core_active == true ]]; then
+  if [[ $restored == true && $core_active == true ]]; then
     systemctl start easytier.service >/dev/null 2>&1 || true
     wait_service_healthy || warn '旧 EasyTier 配置也未能恢复运行，请查看服务状态。'
   fi
   if [[ $core_enabled == true ]]; then systemctl enable easytier.service >/dev/null 2>&1 || true; else systemctl disable easytier.service >/dev/null 2>&1 || true; fi
+  if [[ $restored == true ]]; then remove_config_snapshot "$snapshot" || warn "无法清理配置事务备份：${snapshot}"
+  else warn "配置自动恢复失败，请保留事务备份并人工处理：${snapshot}"; fi
   return 1
 }
 
@@ -1586,7 +2108,7 @@ enable_updates() {
 }
 
 show_web_access_info() {
-  local bind port config_proto config_port candidate server_ip='服务器IP'
+  local bind port config_proto config_port candidate server_ip='服务器IP' mode
   [[ -s $WEB_ARGS_FILE ]] || { info 'Web 控制面板未启用。'; return 0; }
   bind=$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-addr) || return 1
   port=$(arg_value_from_file "$WEB_ARGS_FILE" --api-server-port) || return 1
@@ -1608,15 +2130,30 @@ show_web_access_info() {
   printf '登录用户名：admin\n'
   if [[ -n $WEB_ADMIN_PASSWORD ]]; then printf '本次设置的登录密码：%s\n' "$WEB_ADMIN_PASSWORD"; else printf '登录密码：沿用已有 Web 管理员密码。\n'; fi
   printf 'Core 本机连接：%s://127.0.0.1:%s/admin（通常不要在安全组放行此端口）\n' "$config_proto" "$config_port"
+  mode=$(current_management_mode)
+  if [[ $mode == web ]]; then
+    printf '主机参数权限：Web 完全管理，可在“远程管理”中修改并保存。\n'
+  else
+    printf '主机参数权限：安装器管理，Web 中只读；请用 sudo easytier-installer --configure 修改。\n'
+  fi
 }
 
 show_status() {
-  systemctl status easytier.service --no-pager -l || true
-  if [[ -s $WEB_ARGS_FILE || -f $WEB_SERVICE_FILE ]]; then systemctl status easytier-web.service --no-pager -l || true; fi
+  local mode
+  mode=$(current_management_mode)
+  if [[ $mode == web ]]; then
+    printf '主机参数管理模式：Web 完全管理（面板可修改并持久化）\n'
+  else
+    printf '主机参数管理模式：安装器管理（Web 面板只读）\n'
+  fi
+  systemctl status easytier.service --no-pager -l 2>&1 | redact_sensitive_lines || true
+  if [[ -s $WEB_ARGS_FILE || -f $WEB_SERVICE_FILE ]]; then
+    systemctl status easytier-web.service --no-pager -l 2>&1 | redact_sensitive_lines || true
+  fi
 }
 
 show_logs() {
-  journalctl -u easytier.service -u easytier-web.service -f
+  journalctl -u easytier.service -u easytier-web.service -f 2>&1 | redact_sensitive_lines
 }
 
 restart_running_services() {
@@ -1763,7 +2300,7 @@ do_reset_web_password() {
 do_update() {
   need_root; need_systemd; install_tools; acquire_lock
   [[ -x ${INSTALL_DIR}/easytier-core ]] || die '尚未安装 EasyTier，请先运行 --install。'
-  local before='' after='' was_active=false web_was_active=false
+  local before='' after='' was_active=false web_was_active=false snapshot=''
   [[ -f $VERSION_FILE ]] && before=$(<"$VERSION_FILE")
   systemctl is-active --quiet easytier.service && was_active=true
   systemctl is-active --quiet easytier-web.service && web_was_active=true
@@ -1771,18 +2308,39 @@ do_update() {
   [[ -f $VERSION_FILE ]] && after=$(<"$VERSION_FILE")
   begin_critical_section
   if [[ $BINARY_CHANGED == true && ($was_active == true || $web_was_active == true) ]]; then
-    if [[ $web_was_active == true ]] && \
-       { ! systemctl stop easytier-web.service || ! backup_web_database_for_transaction; }; then
-      warn '无法安全备份 Web 账户数据库，正在回滚程序文件。'
+    if [[ $was_active == true ]] && ! systemctl stop easytier.service; then
+      rollback_binary
+      die '无法停止旧 Core，更新已回滚。'
+    fi
+    if [[ $web_was_active == true ]] && ! systemctl stop easytier-web.service; then
       rollback_binary
       restart_running_services "$web_was_active" "$was_active" || die '程序已回滚，但旧服务仍未启动。'
+      die '无法停止旧 Web 控制面板，更新已回滚。'
+    fi
+    snapshot=$(create_config_snapshot) || {
+      rollback_binary
+      restart_running_services "$web_was_active" "$was_active" || die '程序已回滚，但旧服务仍未启动。'
+      die '更新失败：未能创建一致的配置快照。'
+    }
+    if [[ $web_was_active == true ]] && ! backup_web_database_for_transaction; then
+      warn '无法安全备份 Web 账户数据库，正在回滚程序文件。'
+      restore_config_snapshot "$snapshot" || warn "配置快照恢复失败，请保留：${snapshot}"
+      rollback_binary
+      restart_running_services "$web_was_active" "$was_active" || die '程序已回滚，但旧服务仍未启动。'
+      remove_config_snapshot "$snapshot" || true
       die '更新失败：未能创建一致的 Web 数据库备份。'
     fi
     if ! restart_running_services "$web_was_active" "$was_active"; then
-      warn '新版本未能正常启动，正在回滚。'; rollback_binary
+      warn '新版本未能正常启动，正在回滚程序、网络配置和 Web 数据库。'
+      systemctl stop easytier.service easytier-web.service >/dev/null 2>&1 || true
+      restore_config_snapshot "$snapshot" || die "配置快照恢复失败，请保留并人工处理：${snapshot}"
+      rollback_binary
+      systemctl daemon-reload >/dev/null 2>&1 || true
       restart_running_services "$web_was_active" "$was_active" || die '更新失败，旧版本文件已恢复，但旧服务仍未启动。'
+      remove_config_snapshot "$snapshot" || true
       die '更新失败，已恢复旧版本并重新启动服务。'
     fi
+    remove_config_snapshot "$snapshot" || warn "无法清理更新配置快照：${snapshot}"
   fi
   finish_binary_transaction
   end_critical_section
@@ -1815,7 +2373,11 @@ do_uninstall() {
   rmdir -- "$INSTALL_DIR" "$(dirname "$RUNNER_PATH")" >/dev/null 2>&1 || true
   if [[ $keep == false ]]; then
     rm -f -- "$ARGS_FILE" "$WEB_ARGS_FILE" "$INSTALLER_ENV_FILE" "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new" \
+      "$MANAGEMENT_MODE_FILE" "${MANAGEMENT_MODE_FILE}.new" "$MACHINE_ID_FILE" "${MACHINE_ID_FILE}.new" \
+      "$MANAGED_INSTANCE_ID_FILE" "${MANAGED_INSTANCE_ID_FILE}.new" "$NETWORK_CONFIG_CANDIDATE" \
       "$WEB_DB_FILE" "${WEB_DB_FILE}-wal" "${WEB_DB_FILE}-shm" "${WEB_DB_FILE}-journal"
+    [[ $NETWORK_CONFIG_DIR == "${CONFIG_DIR}/networks" && $CONFIG_DIR != / ]] || die '网络配置目录路径检查失败，拒绝递归删除。'
+    rm -rf -- "$NETWORK_CONFIG_DIR"
     rmdir -- "$CONFIG_DIR" >/dev/null 2>&1 || warn "${CONFIG_DIR} 中仍有其他文件，已保留该目录。"
   fi
   systemctl daemon-reload; ok 'EasyTier 已卸载。'
@@ -1844,6 +2406,8 @@ cleanup_main() {
     fi
   fi
   [[ -z $WORK_TMP || ! -d $WORK_TMP ]] || rm -rf -- "$WORK_TMP"
+  rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new" "${MANAGEMENT_MODE_FILE}.new" \
+    "${MANAGED_INSTANCE_ID_FILE}.new" "${MACHINE_ID_FILE}.new" "$NETWORK_CONFIG_CANDIDATE"
   if ((rc != 0)) && [[ $BINARY_CHANGED == true ]]; then rollback_binary; fi
   return "$rc"
 }

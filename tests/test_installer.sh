@@ -96,7 +96,19 @@ assert_ok existing_web_owns_port tcp 11211
 assert_ok existing_web_owns_port udp 22020
 assert_fail existing_web_owns_port tcp 22020
 assert_fail arg_value_from_file "$WEB_ARGS_FILE" --missing
+printf '%s\n' '--machine-id=legacy-inline-id' >> "$WEB_ARGS_FILE"
+assert_eq "$(arg_value_from_file "$WEB_ARGS_FILE" --machine-id)" 'legacy-inline-id'
 rm -f -- "$WEB_ARGS_FILE"
+
+# 兼容旧配置中的 --flag=value 写法；自定义 machine-id 是上游确定性哈希的种子，必须原样保留。
+printf '%s\n' '--machine-id=legacy-inline-id' > "$ARGS_FILE"
+rm -f -- "$MACHINE_ID_FILE"
+assert_eq "$(ensure_stable_machine_id)" 'legacy-inline-id'
+assert_eq "$(<"$MACHINE_ID_FILE")" 'legacy-inline-id'
+rm -f -- "$ARGS_FILE" "$MACHINE_ID_FILE"
+printf '%s\n' "--config-dir=${NETWORK_CONFIG_DIR}" > "$ARGS_FILE"
+assert_eq "$(current_management_mode)" web
+rm -f -- "$ARGS_FILE"
 
 # shellcheck disable=SC2317,SC2329 # Invoked indirectly by port_is_listening.
 ss() {
@@ -116,7 +128,10 @@ cat > "$TEST_ROOT/fake-core" <<'EOF'
 #!/usr/bin/env bash
 printf '[%s]\n' "$@" > "$ARG_LOG"
 [[ " $* " != *' --bad '* ]] || exit 2
-exit 1
+# EasyTier v2.6.4 对“仅 CLI 参数 + /dev/null”的检查会返回 1；真实 TOML
+# 的 --check-config 则应成功。这里同时模拟这两种上游行为。
+[[ " $* " == *' --config-file /dev/null '* ]] && exit 1
+exit 0
 EOF
 chmod +x "$TEST_ROOT/fake-core"
 export ARG_LOG="$TEST_ROOT/args.log"
@@ -133,6 +148,8 @@ chmod +x "$INSTALL_DIR/easytier-web-embed"
 hostname() { printf 'test-host\n'; }
 configure </dev/null
 assert_eq "$WEB_ENABLED" true
+assert_eq "$MANAGEMENT_MODE" installer
+assert_eq "$(<"${MANAGEMENT_MODE_FILE}.new")" installer
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --instance-name)" "$MANAGED_INSTANCE_NAME"
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --private-mode)" true
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --relay-network-whitelist)" 'my-easytier'
@@ -145,7 +162,9 @@ grep -Fx -- '--disable-registration' "${WEB_ARGS_FILE}.new" >/dev/null || fail '
 ((pass+=1))
 [[ $WEB_ADMIN_PASSWORD =~ ^et-[0-9a-fA-F]{20}$ ]] || fail "invalid default web password: $WEB_ADMIN_PASSWORD"
 ((pass+=1))
-rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new"
+[[ ! -e $NETWORK_CONFIG_CANDIDATE && ! -e ${MANAGED_INSTANCE_ID_FILE}.new ]] || fail 'installer mode unexpectedly staged a Web-managed network'
+((pass+=1))
+rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new" "${MANAGEMENT_MODE_FILE}.new"
 
 # 系统中其他程序占用 Web 默认端口时，向导应自动选择相邻空闲端口。
 # shellcheck disable=SC2317,SC2329 # Invoked indirectly by configure through port_is_listening.
@@ -155,7 +174,9 @@ ss() {
     *' -lnu '*) printf 'UNCONN 0 0 127.0.0.1:22020 0.0.0.0:*\n';;
   esac
 }
-configure <<< $'2\ny'
+configure <<< $'1\n2\ny'
+assert_eq "$MANAGEMENT_MODE" installer
+assert_eq "$(<"${MANAGEMENT_MODE_FILE}.new")" installer
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --private-mode)" false
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --relay-network-whitelist)" '*'
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --relay-all-peer-rpc)" false
@@ -167,12 +188,48 @@ assert_eq "$(arg_value_from_file "${WEB_ARGS_FILE}.new" --config-server-port)" '
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --config-server)" 'udp://127.0.0.1:22021/admin'
 
 # 公开共享模式必须二次确认；拒绝确认时安全回退到默认私有模式。
-configure <<< $'2\nn'
+configure <<< $'1\n2\nn'
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --private-mode)" true
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --relay-network-whitelist)" 'my-easytier'
 assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --relay-all-peer-rpc)" false
 unset -f ss
-rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new"
+rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new" "${MANAGEMENT_MODE_FILE}.new"
+
+# Web 新装模式必须把网络参数移入以固定 UUID 命名的 TOML；Core 命令行只保留进程级参数。
+fixed_machine_id='11111111-1111-4111-a111-111111111111'
+fixed_instance_id='22222222-2222-4222-a222-222222222222'
+printf '%s\n' "$fixed_machine_id" > "$MACHINE_ID_FILE"
+printf '%s\n' "$fixed_instance_id" > "$MANAGED_INSTANCE_ID_FILE"
+configure <<< $'2'
+assert_eq "$MANAGEMENT_MODE" web
+assert_eq "$(<"${MANAGEMENT_MODE_FILE}.new")" web
+assert_eq "$WEB_ENABLED" true
+assert_eq "$(<"${MANAGED_INSTANCE_ID_FILE}.new")" "$fixed_instance_id"
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --machine-id)" "$fixed_machine_id"
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --config-dir)" "$NETWORK_CONFIG_DIR"
+assert_eq "$(arg_value_from_file "${ARGS_FILE}.new" --config-server)" 'udp://127.0.0.1:22020/admin'
+grep -Fx -- '--daemon' "${ARGS_FILE}.new" >/dev/null || fail 'Web mode Core args are missing --daemon'
+grep -Fx -- '--disable-env-parsing' "${ARGS_FILE}.new" >/dev/null || fail 'Web mode Core args are missing --disable-env-parsing'
+((pass+=2))
+while IFS= read -r arg; do
+  case $arg in
+    --instance-name|--instance-name=*|--network-name|--network-name=*|--network-secret|--network-secret=*|--hostname|--hostname=*|\
+    --dhcp|--dhcp=*|--ipv4|--ipv4=*|--listeners|--listeners=*|--peers|--peers=*|--external-node|--external-node=*|\
+    --proxy-networks|--proxy-networks=*|--socks5|--socks5=*|--vpn-portal|--vpn-portal=*|--compression|--compression=*|\
+    --private-mode|--private-mode=*|--relay-network-whitelist|--relay-network-whitelist=*|--relay-all-peer-rpc|--relay-all-peer-rpc=*)
+      fail "Web mode leaked network option into Core args: $arg";;
+  esac
+done < "${ARGS_FILE}.new"
+((pass+=1))
+assert_ok grep -Fx "instance_id = \"${fixed_instance_id}\"" "$NETWORK_CONFIG_CANDIDATE"
+assert_ok grep -Fx 'instance_name = "easytier-oneclick"' "$NETWORK_CONFIG_CANDIDATE"
+assert_ok grep -Fx 'network_name = "my-easytier"' "$NETWORK_CONFIG_CANDIDATE"
+grep -E '^network_secret = "et-[0-9a-fA-F]{20}"$' "$NETWORK_CONFIG_CANDIDATE" >/dev/null || fail 'Web mode TOML is missing the generated network secret'
+((pass+=1))
+assert_ok grep -Fx 'listeners = [' "$NETWORK_CONFIG_CANDIDATE"
+assert_ok grep -Fx 'private_mode = true' "$NETWORK_CONFIG_CANDIDATE"
+rm -f -- "${ARGS_FILE}.new" "${WEB_ARGS_FILE}.new" "${MANAGEMENT_MODE_FILE}.new" \
+  "${MANAGED_INSTANCE_ID_FILE}.new" "$NETWORK_CONFIG_CANDIDATE"
 
 cat > "$INSTALL_DIR/easytier-cli" <<'EOF'
 #!/usr/bin/env bash
@@ -185,6 +242,9 @@ elif [[ $NODE_MODE == bad ]]; then
   cat <<'JSON'
 {"config":"listeners = [\"tcp://0.0.0.0:11010\", \"udp://0.0.0.0:11010\", \"ws://0.0.0.0:11011\"]","listeners":["ring://id","tcp://0.0.0.0:11010","tcp://[::]:11010","udp://0.0.0.0:11010","udp://[::]:11010"]}
 JSON
+elif [[ $NODE_MODE == empty ]]; then
+  printf '%s\n' 'Error: no running instances found' >&2
+  exit 1
 else
   cat <<'JSON'
 {"listeners":["ring://id","tcp://0.0.0.0:11010","tcp://[::]:11010","udp://0.0.0.0:11010","udp://[::]:11010","ws://0.0.0.0:11011/"],"config":""}
@@ -197,6 +257,7 @@ printf '%s\n' '--instance-name' "$MANAGED_INSTANCE_NAME" \
   '--listeners' 'tcp://0.0.0.0:11010' '--listeners' 'udp://0.0.0.0:11010' \
   '--listeners' 'ws://0.0.0.0:11011' \
   '--rpc-portal' '127.0.0.1:15888' > "$ARGS_FILE"
+printf '%s\n' installer > "$MANAGEMENT_MODE_FILE"
 export CLI_ARG_LOG="$TEST_ROOT/cli-args.log"
 export NODE_MODE=good
 assert_ok verify_runtime_config
@@ -206,6 +267,40 @@ export NODE_MODE=bad
 assert_fail verify_runtime_config
 export NODE_MODE=error
 assert_fail verify_runtime_config
+
+# Web 管理模式只验证 Core RPC 与固定实例是否可达，不再拿已移交给 Web 的监听参数做静态比对。
+mkdir -p "$NETWORK_CONFIG_DIR"
+printf 'instance_id = "%s"\n' "$fixed_instance_id" > "${NETWORK_CONFIG_DIR}/${fixed_instance_id}.toml"
+printf '%s\n' web > "$MANAGEMENT_MODE_FILE"
+printf '%s\n' '--daemon' '--disable-env-parsing' '--rpc-portal' '127.0.0.1:15888' \
+  '--config-dir' "$NETWORK_CONFIG_DIR" '--config-server' 'udp://127.0.0.1:22020/admin' \
+  '--machine-id' "$fixed_machine_id" > "$ARGS_FILE"
+REQUIRE_MANAGED_INSTANCE=true
+export NODE_MODE=good
+assert_ok verify_runtime_config
+grep -F -- "-i ${fixed_instance_id} node" "$CLI_ARG_LOG" >/dev/null || fail 'Web health check did not select the fixed instance id'
+((pass+=1))
+export NODE_MODE=bad
+assert_ok verify_runtime_config
+export NODE_MODE=error
+assert_fail verify_runtime_config
+# shellcheck disable=SC2034 # Read dynamically by verify_runtime_config from the sourced installer.
+REQUIRE_MANAGED_INSTANCE=false
+export NODE_MODE=good
+assert_ok verify_runtime_config
+if grep -F -- ' -i ' "$CLI_ARG_LOG" >/dev/null; then fail 'ordinary Web health check unexpectedly required the installer-created network'; fi
+((pass+=1))
+export NODE_MODE=empty
+assert_ok verify_runtime_config
+export NODE_MODE=error
+assert_fail verify_runtime_config
+
+# Restore installer-mode fixtures for the generic service-start tests below.
+printf '%s\n' installer > "$MANAGEMENT_MODE_FILE"
+printf '%s\n' '--instance-name' "$MANAGED_INSTANCE_NAME" \
+  '--listeners' 'tcp://0.0.0.0:11010' '--listeners' 'udp://0.0.0.0:11010' \
+  '--listeners' 'ws://0.0.0.0:11011' \
+  '--rpc-portal' '127.0.0.1:15888' > "$ARGS_FILE"
 export NODE_MODE=good
 assert_eq "$(printf '%s\n' '{"config":"{\"listeners\":[\"fake://inside-string\"]}","listeners":["tcp://[::]:11010","udp://0.0.0.0:11010"]}' | json_array_field listeners)" \
   '"tcp://[::]:11010","udp://0.0.0.0:11010"'
@@ -361,6 +456,63 @@ grep -Fx 'enable easytier.service' "$MOCK_LOG" >/dev/null || fail 'service was n
 grep -Fx 'restart easytier.service' "$MOCK_LOG" >/dev/null || fail 'active service was not restarted'
 if grep -F -- '--now' "$MOCK_LOG" >/dev/null; then fail 'start flow still uses enable --now'; fi
 ((pass+=3))
+
+# 配置切换中 Core 启动失败时，管理模式、全部网络文件和 Web 数据库必须一起回滚。
+old_instance_id="$fixed_instance_id"
+new_instance_id='33333333-3333-4333-a333-333333333333'
+mkdir -p "$NETWORK_CONFIG_DIR"
+printf 'old-core\n' > "$ARGS_FILE"
+printf 'old-web\n' > "$WEB_ARGS_FILE"
+printf 'installer\n' > "$MANAGEMENT_MODE_FILE"
+printf '%s\n' "$old_instance_id" > "$MANAGED_INSTANCE_ID_FILE"
+printf 'old-network\n' > "${NETWORK_CONFIG_DIR}/${old_instance_id}.toml"
+printf 'old-db\n' > "$WEB_DB_FILE"
+printf 'old-wal\n' > "${WEB_DB_FILE}-wal"
+
+printf '%s\n' '--daemon' '--disable-env-parsing' '--rpc-portal' '127.0.0.1:15888' \
+  '--config-dir' "$NETWORK_CONFIG_DIR" '--config-server' 'udp://127.0.0.1:22020/admin' \
+  '--machine-id' "$fixed_machine_id" > "${ARGS_FILE}.new"
+printf 'new-web\n' > "${WEB_ARGS_FILE}.new"
+printf 'web\n' > "${MANAGEMENT_MODE_FILE}.new"
+printf '%s\n' "$new_instance_id" > "${MANAGED_INSTANCE_ID_FILE}.new"
+printf 'new-network\n' > "$NETWORK_CONFIG_CANDIDATE"
+WEB_ENABLED=false
+WEB_ADMIN_PASSWORD=''
+# shellcheck disable=SC2317,SC2329 # Invoked by activate_config under test.
+start_web_service_checked() {
+  printf 'changed-db\n' > "$WEB_DB_FILE"
+  printf 'changed-wal\n' > "${WEB_DB_FILE}-wal"
+  return 0
+}
+# shellcheck disable=SC2317,SC2329 # Invoked by activate_config under test.
+start_service_checked() {
+  printf 'changed-old-network\n' > "${NETWORK_CONFIG_DIR}/${old_instance_id}.toml"
+  printf 'new-shm\n' > "${WEB_DB_FILE}-shm"
+  return 1
+}
+# shellcheck disable=SC2317,SC2329 # Invoked during rollback under test.
+wait_web_healthy() { return 0; }
+# shellcheck disable=SC2317,SC2329 # Invoked during rollback under test.
+wait_service_healthy() { return 0; }
+assert_fail activate_config
+assert_eq "$(<"$ARGS_FILE")" old-core
+assert_eq "$(<"$WEB_ARGS_FILE")" old-web
+assert_eq "$(<"$MANAGEMENT_MODE_FILE")" installer
+assert_eq "$(<"$MANAGED_INSTANCE_ID_FILE")" "$old_instance_id"
+assert_eq "$(<"$WEB_DB_FILE")" old-db
+assert_eq "$(<"${WEB_DB_FILE}-wal")" old-wal
+assert_eq "$(<"${NETWORK_CONFIG_DIR}/${old_instance_id}.toml")" old-network
+[[ ! -e ${WEB_DB_FILE}-shm ]] || fail 'activation rollback retained a new Web DB sidecar'
+[[ ! -e ${NETWORK_CONFIG_DIR}/${new_instance_id}.toml ]] || fail 'activation rollback retained the failed Web network'
+[[ ! -e ${ARGS_FILE}.new && ! -e ${WEB_ARGS_FILE}.new && ! -e ${MANAGEMENT_MODE_FILE}.new && \
+   ! -e ${MANAGED_INSTANCE_ID_FILE}.new && ! -e $NETWORK_CONFIG_CANDIDATE ]] || fail 'activation rollback retained candidate files'
+if find "$CONFIG_DIR" -maxdepth 1 -type d -name '.activate-backup.*' -print -quit | grep -q .; then
+  fail 'activation rollback retained its transaction snapshot'
+fi
+((pass+=4))
+rm -f -- "$WEB_DB_FILE" "${WEB_DB_FILE}-wal" "$ARGS_FILE" "$WEB_ARGS_FILE" \
+  "$MANAGEMENT_MODE_FILE" "$MANAGED_INSTANCE_ID_FILE"
+rm -rf -- "$NETWORK_CONFIG_DIR"
 
 GOOD_BYTES='verified-release-bytes'
 BAD_BYTES='mirror-returned-wrong-bytes'
