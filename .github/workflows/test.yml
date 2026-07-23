@@ -116,6 +116,7 @@ jobs:
           INSTANCE_ID=$(sudo /opt/easytier/easytier-cli -p 127.0.0.1:15888 -n easytier-oneclick node config | \
             awk -F '"' '/^[[:space:]]*instance_id[[:space:]]*=/ { print $2; exit }')
           test -n "$INSTANCE_ID"
+          before_config=$(sudo /opt/easytier/easytier-cli -p 127.0.0.1:15888 -i "$INSTANCE_ID" node config)
           python3 - <<'PY'
           import hashlib
           import http.cookiejar
@@ -132,12 +133,13 @@ jobs:
               urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
           )
 
-          def request(path, payload=None):
+          def request(path, payload=None, method=None):
               body = None if payload is None else json.dumps(payload).encode()
               req = urllib.request.Request(
                   base + path,
                   data=body,
                   headers={'Content-Type': 'application/json'},
+                  method=method,
               )
               with opener.open(req, timeout=8) as response:
                   raw = response.read()
@@ -165,25 +167,18 @@ jobs:
                   f'installer-managed instance never reported config_permission=3: {last_error}'
               )
 
-          original = request(
-              f'/machines/{machine_id}/networks/config/{instance_id}'
+          request(
+              f'/machines/{machine_id}/networks/{instance_id}',
+              method='DELETE',
           )
-          attempted = dict(original)
-          attempted['hostname'] = 'must-stay-read-only'
-          try:
-              request(
-                  f'/machines/{machine_id}/networks',
-                  {'config': attempted, 'save': True},
-              )
-          except urllib.error.HTTPError as error:
-              assert error.code == 400, error.code
-          else:
-              raise AssertionError('installer-managed network unexpectedly accepted a Web edit')
-          current = request(
-              f'/machines/{machine_id}/networks/config/{instance_id}'
+          metas = request(
+              f'/machines/{machine_id}/networks/metas',
+              {'instance_ids': [instance_id]},
           )
-          assert current.get('hostname') == original.get('hostname'), current
+          assert metas['metas'][instance_id]['config_permission'] == 3, metas
           PY
+          after_config=$(sudo /opt/easytier/easytier-cli -p 127.0.0.1:15888 -i "$INSTANCE_ID" node config)
+          test "$after_config" = "$before_config"
       - name: Reconfigure an existing installation as a shared relay
         run: printf '\n2\ny\n' | sudo easytier-installer --configure
       - name: Verify shared relay mode and services after reconfiguration
