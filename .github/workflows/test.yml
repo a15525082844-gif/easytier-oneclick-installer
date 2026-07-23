@@ -388,6 +388,8 @@ jobs:
           import http.cookiejar
           import json
           import os
+          import time
+          import urllib.error
           import urllib.request
 
           base = f"http://127.0.0.1:{os.environ['WEB_PORT']}/api/v1"
@@ -413,10 +415,26 @@ jobs:
               'username': 'admin',
               'password': hashlib.md5(b'Fixed_Web-Password:2026!').hexdigest(),
           })
-          request(
-              f'/machines/{machine_id}/networks/{instance_id}',
-              method='DELETE',
-          )
+          last_error = None
+          for _ in range(40):
+              try:
+                  request(
+                      f'/machines/{machine_id}/networks/{instance_id}',
+                      method='DELETE',
+                  )
+                  break
+              except urllib.error.HTTPError as error:
+                  details = error.read().decode(errors='replace')
+                  if error.code != 404 or 'Client not found' not in details:
+                      raise AssertionError(
+                          f'unexpected DELETE response HTTP {error.code}: {details}'
+                      ) from error
+                  last_error = f'HTTP {error.code}: {details}'
+                  time.sleep(1)
+          else:
+              raise AssertionError(
+                  f'Web-managed Core did not reconnect in time for deletion: {last_error}'
+              )
           PY
 
           for attempt in {1..30}; do
